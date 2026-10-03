@@ -1,0 +1,46 @@
+name: qwen3.8-flash-next-strata
+backend: strata
+# Engine args/paths live in /srv/strata-localai-backend/strata-backend.json.
+
+context_size: 128000
+threads: 8
+
+parameters:
+  model: qwen3.8-flash-next-strata
+
+# Explicit tool-call format: the model emits Qwen3-native
+# <tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call> which matches
+# the "xiaomi-mimo" preset (tool_call tag + JSON body). The preset makes
+# parsing deterministic but does NOT remove raw tag text from streamed
+# content. The bridge supplies parsed ChatDelta content + tool_calls to
+# prevent that leak in streaming clients such as Zoo Code.
+function:
+  xml_format_preset: xiaomi-mimo
+
+# Qwen ChatML, rendered per-message via chat_message (each message becomes
+# its own im_start/im_end frame) and the final chat template appends the
+# assistant generation header. NOTE: the chat-level template does NOT see
+# per-message fields -- only .Input (joined chat_message outputs) -- so any
+# per-message markup must live in chat_message, not chat.
+# Tool-call history: assistant messages carrying tool_calls are re-rendered
+# as <tool_call> blocks (Qwen3-native) so the model sees which function
+# it called earlier; tool RESULTS are rendered as a user frame wrapped in
+# <tool_response> (Qwen3-native) -- a bare <|im_start|>tool role frame is
+# unknown to Qwen3 and made it emit im_end as its first token (empty replies).
+# Tool definitions themselves are injected by the bridge (see
+# _tool_system_block in strata_grpc_backend.py), merged into the first
+# system frame.
+template:
+  use_tokenizer_template: false
+  join_chat_messages_by_character: ""
+  chat_message: |
+    {{ if eq .RoleName "tool" }}<|im_start|>user
+    <tool_response>
+    {{ .Content }}
+    </tool_response><|im_end|>{{ else }}<|im_start|>{{ .RoleName }}
+    {{ .Content }}
+    {{ if .FunctionCall }}{{ range .FunctionCall }}<tool_call>
+    {"name": "{{ .FunctionCall.Name }}", "arguments": {{ .FunctionCall.Arguments }}}
+    </tool_call>{{ end }}{{ end }}<|im_end|>{{ end }}
+  chat: |
+    {{ .Input }}<|im_start|>assistant

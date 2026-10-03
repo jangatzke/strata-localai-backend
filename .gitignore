@@ -1,0 +1,15 @@
+# Local runtime/configuration (example is tracked)
+strata-backend.json
+backend_pb2.py
+backend_pb2_grpc.py
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.log
+*.bak*
+strata-badprompt-*
+.env
+.env.*
+!*.example
+.DS_Store
