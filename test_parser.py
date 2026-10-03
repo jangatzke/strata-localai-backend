@@ -81,6 +81,29 @@ class ToolCallStreamParserTests(unittest.TestCase):
                 raw = '<tool_call>' + body + '</tool_call>'
                 self.assertEqual(events(raw, specs=specs), [('invalid_tool',)])
 
+    def test_final_report_recovers_unescaped_quotes_and_newlines_only(self):
+        parser = Parser({'attempt_completion': {'result': {'type': 'string'},
+                                                'command': {'type': 'string'}},
+                         'execute_command': {'command': {'type': 'string'}}})
+        malformed = ('<tool_call>{"name":"attempt_completion","arguments":{"result":'
+                     '"# Bericht\nDas Feld "result" ist dokumentiert.\\nFertig."}}</tool_call>')
+        events = []
+        for char in malformed:
+            events.extend(parser.feed(char))
+        events.extend(parser.flush())
+        calls = [event for event in events if event[0] == 'tool']
+        self.assertEqual(len(calls), 1, events)
+        self.assertEqual(calls[0][1], 'attempt_completion')
+        self.assertEqual(json.loads(calls[0][2])['result'],
+                         '# Bericht\nDas Feld "result" ist dokumentiert.\nFertig.')
+        unsafe = Parser({'execute_command': {'command': {'type': 'string'}}})
+        self.assertTrue(any(event[0] == 'invalid_tool' for event in
+                            unsafe.feed(malformed) + unsafe.flush()))
+        side_effect = Parser({'execute_command': {'command': {'type': 'string'}}})
+        other = malformed.replace('attempt_completion', 'execute_command').replace('result', 'command')
+        self.assertTrue(any(event[0] == 'invalid_tool' for event in
+                            side_effect.feed(other) + side_effect.flush()))
+
     def test_rejection_diagnostic_exposes_shape_not_argument_values(self):
         secret = 'do-not-log-this-secret'
         parser = Parser({'attempt_completion': {'result': {'type': 'string'}}})
@@ -227,6 +250,27 @@ class ToolCallStreamParserTests(unittest.TestCase):
                                for r in replies for d in r.chat_deltas)
         self.assertIn('Tool call rejected', safe_content)
         self.assertNotIn('<tool_call>', safe_content)
+
+        # A malformed final report is emitted as a structured completion in
+        # streaming mode, even when Zoo offers an optional command parameter.
+        opts.Tools = json.dumps([{'type': 'function', 'function': {
+            'name': 'attempt_completion', 'parameters': {'type': 'object',
+            'properties': {'result': {'type': 'string'},
+                           'command': {'type': 'string'}}}}}])
+        report = '# Bericht\nDas Feld "result" ist dokumentiert.'
+        raw = ('<tool_call>{"name":"attempt_completion",'
+               '"arguments":{"result":"' + report + '"}}</tool_call>')
+        chunks = [raw[i:i + 3] for i in range(0, len(raw), 3)]
+        replies = list(ns['_stream'](Probe(), opts))
+        calls = [t for r in replies for d in r.chat_deltas
+                 for t in getattr(d, 'tool_calls', [])]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, 'attempt_completion')
+        self.assertEqual(json.loads(calls[0].arguments), {'result': report})
+        self.assertNotIn(b'<tool_call>', b''.join(r.message for r in replies))
+        self.assertNotIn('<tool_call>', ''.join(getattr(d, 'content', '')
+                                               for r in replies for d in r.chat_deltas))
+        opts.Tools = json.dumps(tools)
 
         # Tool-first responses have no genuine content or reasoning to make
         # LocalAI prefer chat deltas. They must still carry the tool call

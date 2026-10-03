@@ -380,6 +380,45 @@ class ToolCallStreamParser:
                                f"function_closed={'</function>' in block}")
         return ("invalid_tool",)
 
+    def _recover_completion_result(self, block):
+        """Salvage only a final report with malformed JSON string quoting.
+
+        Long Markdown reports can contain bare quotes or literal newlines in
+        the result string. Require an offered completion with a string result
+        and a single-argument envelope; never repair a side-effecting tool call.
+        """
+        properties = self.tool_specs.get("attempt_completion")
+        if not isinstance(properties, dict) or "result" not in properties:
+            return None
+        result_spec = properties["result"]
+        if not isinstance(result_spec, dict) or result_spec.get("type") != "string":
+            return None
+        match = re.fullmatch(
+            r'\s*\{\s*"name"\s*:\s*"attempt_completion"\s*,\s*'
+            r'"arguments"\s*:\s*\{\s*"result"\s*:\s*"(.*)"\s*\}\s*\}\s*',
+            block, re.DOTALL,
+        )
+        if not match:
+            return None
+        raw = match.group(1)
+        result = []
+        i = 0
+        while i < len(raw):
+            if raw[i] == "\\" and i + 1 < len(raw):
+                escape = raw[i + 1]
+                if escape in '"\\/bfnrt':
+                    result.append(json.loads('"\\' + escape + '"'))
+                    i += 2
+                    continue
+                if escape == "u" and re.fullmatch(r"[0-9a-fA-F]{4}", raw[i + 2:i + 6]):
+                    result.append(json.loads('"' + raw[i:i + 6] + '"'))
+                    i += 6
+                    continue
+            result.append(raw[i])
+            i += 1
+        return ("tool", "attempt_completion",
+                json.dumps({"result": "".join(result)}, ensure_ascii=True))
+
     def _parse_block(self):
         block = self.block
         self.block = ""
@@ -393,6 +432,10 @@ class ToolCallStreamParser:
                 args = json.dumps(args, ensure_ascii=False)
             return ("tool", name, args)
         except Exception:
+            completion = self._recover_completion_result(block)
+            if completion is not None:
+                print("[strata-backend] recovered malformed final-report string", flush=True)
+                return completion
             # Zoo's system prompt sometimes induces the alternate
             # <function=name><parameter=key>value</parameter></function>
             # dialect inside a tool_call block. Only accept it when the
