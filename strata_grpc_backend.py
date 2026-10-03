@@ -509,6 +509,22 @@ class ToolCallStreamParser:
         return out
 
 
+def _generation_limit(requested, prompt_tokens, max_context):
+    """Honor a client limit; otherwise allow generation up to context capacity.
+
+    Strata's GEN protocol requires a positive integer, even for an unlimited
+    client request. The engine context (minus its eight-token safety margin)
+    is the only bound in that case, as in Strata's standalone server.
+    """
+    if requested > 0:
+        return requested
+    room = max_context - prompt_tokens - 8
+    if room < 1:
+        raise EngineError(f"prompt ({prompt_tokens} tokens) leaves no room to answer "
+                          f"in the context ({max_context})")
+    return room
+
+
 class StrataBackend(pb_grpc.BackendServicer):
     def __init__(self, cfg: dict, tok):
         self.cfg = cfg
@@ -636,7 +652,12 @@ class StrataBackend(pb_grpc.BackendServicer):
                 prompt = head + "\n" + tools_text + IM_END + "\n" + prompt
         print(f"[strata-backend] prompt({len(prompt)} chars): {prompt[:600]!r} ... TAIL: {prompt[-400:]!r}", flush=True)
         ids = self.tok.encode(prompt, parse_special=True)
-        max_new = o.Tokens if o.Tokens > 0 else 4096
+        if o.Tokens <= 0:
+            self._ensure_loaded()  # READY supplies the actual engine context
+        max_context = self.engine.max_context if o.Tokens <= 0 else 0
+        max_new = _generation_limit(o.Tokens, len(ids), max_context)
+        print(f"[strata-backend] output tokens: requested={o.Tokens} "
+              f"engine_limit={max_new}", flush=True)
         keys = self._sampling_keys(o)
         stop_prompts = [sp for sp in (o.StopPrompts or []) if sp]
 

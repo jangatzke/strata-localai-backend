@@ -27,6 +27,20 @@ def events(text, size=3, specs=None):
     return result
 
 
+class OutputBudgetTests(unittest.TestCase):
+    def test_unset_client_limit_uses_remaining_engine_context(self):
+        node = next(n for n in module.body if isinstance(n, ast.FunctionDef)
+                    and n.name == '_generation_limit')
+        scope = {'EngineError': RuntimeError}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), 'exec'), scope)
+        limit = scope['_generation_limit']
+        self.assertEqual(limit(0, 50000, 128000), 128000 - 50000 - 8)
+        self.assertEqual(limit(-1, 50000, 128000), 128000 - 50000 - 8)
+        self.assertEqual(limit(4096, 50000, 128000), 4096)
+        with self.assertRaisesRegex(RuntimeError, 'no room'):
+            limit(0, 127995, 128000)
+
+
 class ToolCallStreamParserTests(unittest.TestCase):
     def test_zoo_function_parameter_variant_becomes_structured_tool_call(self):
         raw = ('Backend-Build ebenfalls erfolgreich. Jetzt der Frontend-Build:\n\n'
@@ -176,7 +190,9 @@ class ToolCallStreamParserTests(unittest.TestCase):
                   IM_START='<|' + 'im_start' + '|>', IM_END='<|' + 'im_end' + '|>')
         tool_block = next(n for n in module.body if isinstance(n, ast.FunctionDef)
                           and n.name == '_tool_system_block')
-        exec(compile(ast.Module(body=[tool_block, stream], type_ignores=[]), str(SOURCE), 'exec'), ns)
+        budget_fn = next(n for n in module.body if isinstance(n, ast.FunctionDef)
+                         and n.name == '_generation_limit')
+        exec(compile(ast.Module(body=[tool_block, budget_fn, stream], type_ignores=[]), str(SOURCE), 'exec'), ns)
         raw = ('Run the build:\n<tool_call><function=execute_command>'
                '<parameter=command>npm run build --workspace frontend</parameter>'
                '<parameter=timeout>300</parameter></function></tool_call>')
@@ -195,11 +211,15 @@ class ToolCallStreamParserTests(unittest.TestCase):
                 self.gen_lock = contextlib.nullcontext()
                 self.stop_ids = set()
                 self.think_close_ids = {1}
+                self.engine = SimpleNamespace(max_context=1024)
             def _check_identity(self, value):
+                pass
+            def _ensure_loaded(self):
                 pass
             def _sampling_keys(self, opts):
                 return {}
             def _generate(self, ids, max_new, keys):
+                self.seen_max_new = max_new
                 yield 1
                 for tid in range(2, 2 + len(chunks)):
                     yield tid
@@ -291,6 +311,10 @@ class ToolCallStreamParserTests(unittest.TestCase):
         result = ns['Predict'](Probe(), opts, None)
         self.assertEqual(result.message, raw.encode(),
                          'non-streaming Predict still needs raw text for LocalAI parsing')
+        opts.Tokens = 0
+        probe = Probe()
+        list(ns['_stream'](probe, opts))
+        self.assertEqual(probe.seen_max_new, probe.engine.max_context - 1 - 8)
 
     def test_empty_think_frame_does_not_create_reasoning_block(self):
         methods = next(n for n in module.body if isinstance(n, ast.ClassDef) and
@@ -304,7 +328,9 @@ class ToolCallStreamParserTests(unittest.TestCase):
         ns = dict(json=json, re=re, codecs=codecs, time=time, uuid=uuid,
                   pb=pb, ToolCallStreamParser=Parser,
                   IM_START='<|' + 'im_start' + '|>', IM_END='<|' + 'im_end' + '|>')
-        exec(compile(ast.Module(body=[tool_block, stream], type_ignores=[]), str(SOURCE), 'exec'), ns)
+        budget_fn = next(n for n in module.body if isinstance(n, ast.FunctionDef)
+                         and n.name == '_generation_limit')
+        exec(compile(ast.Module(body=[tool_block, budget_fn, stream], type_ignores=[]), str(SOURCE), 'exec'), ns)
         tokens = [b'<think>', b'\n', b'\n', b'</think>',
                   b'<tool_call>{"name":"update_todo_list",',
                   b'"arguments":{"todos":"[ ] Check"}}</tool_call>']
