@@ -636,11 +636,11 @@ class StrataBackend(pb_grpc.BackendServicer):
                           f"({n / elapsed:.1f} tok/s)", flush=True)
                 return {"tokens": n, "elapsed": elapsed}
 
-    def _stream(self, o, streaming=True):
+    def _stream(self, o, streaming=True, retry_count=0, retry_prompt=None):
         """Common Predict/PredictStream logic: yields pb.Reply per delta."""
         self._check_identity(o.ModelIdentity)
-        prompt = o.Prompt
-        tools_text = _tool_system_block(o.Tools or "")
+        prompt = retry_prompt if retry_prompt is not None else o.Prompt
+        tools_text = _tool_system_block(o.Tools or "") if retry_prompt is None else ""
         if tools_text:
             # merge the tools into the FIRST system frame: a second adjacent
             # system frame makes Qwen3 emit im_end as its first token
@@ -674,6 +674,7 @@ class StrataBackend(pb_grpc.BackendServicer):
         ct_sent = 0          # content chars already flushed
         tc_index = 0         # tool call index for chat deltas
         rejected_tool = False # current reply must not expose rejected raw markup
+        invalid_seen = False
         # Only the functions actually offered in this request may use the
         # Zoo function/parameter fallback. Their JSON Schemas also preserve
         # numeric/boolean argument types when the model emits plain text.
@@ -696,7 +697,7 @@ class StrataBackend(pb_grpc.BackendServicer):
             """Route a decoded chunk through the tool parser + think phases.
 
             Returns (reasoning_delta, content_delta, tool_deltas)."""
-            nonlocal post_think, started_text, tc_index, rejected_tool
+            nonlocal post_think, started_text, tc_index, rejected_tool, invalid_seen
             events = tool_parser.feed(chunk) if chunk else []
             if closing:
                 events += tool_parser.flush()
@@ -708,9 +709,14 @@ class StrataBackend(pb_grpc.BackendServicer):
                           + tool_parser.last_rejection,
                           flush=True)
                     rejected_tool = True
+                    invalid_seen = True
                     post_think = True
                     started_text = True
-                    ct_part += "Tool call rejected: invalid format. Retry with an offered tool."
+                    # Hermes does not retry a plain-text error on its own.
+                    # Hold it while a bounded internal regeneration is possible.
+                    if not (streaming and retry_count < 2 and tool_specs and
+                            tc_index == 0 and not cd_content):
+                        ct_part += "Tool call rejected: invalid format. Retry with an offered tool."
                     continue
                 if ev[0] == "tool":
                     tc_index += 1
@@ -873,6 +879,22 @@ class StrataBackend(pb_grpc.BackendServicer):
         cd_content += ct_part
         if cd_reason[rs_sent:] or cd_content[ct_sent:] or tools:
             yield make_reply(cd_reason[rs_sent:], cd_content[ct_sent:], tools)
+        if streaming and invalid_seen and tc_index == 0 and not cd_content and tool_specs and retry_count < 2:
+            # Re-generate instead of executing or repairing a partial/unknown
+            # tool call. Do not replay the rejected argument values in the
+            # prompt or journal. The first assistant frame is already open.
+            retry_text = (
+                "I did not produce a valid tool call." + IM_END + "\n" +
+                IM_START + "user\n" +
+                "The last tool call was rejected. Retry with exactly one offered "
+                "tool using the required JSON tool_call format. Do not repeat "
+                "the invalid call or answer with prose." + IM_END + "\n" +
+                IM_START + "assistant\n"
+            )
+            print(f"[strata-backend] retrying rejected tool-only turn ({retry_count + 1}/2)",
+                  flush=True)
+            yield from self._stream(o, streaming=streaming, retry_count=retry_count + 1,
+                                    retry_prompt=prompt + retry_text)
 
     # -- gRPC surface ------------------------------------------------------
 

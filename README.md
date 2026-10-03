@@ -81,6 +81,7 @@ The smoke test checks for `finish_reason: tool_calls`, an offered `update_todo_l
 ## Operational notes
 
 - Output length: a positive client `max_tokens` is passed through unchanged. When omitted or non-positive, the bridge does not impose a fixed output budget; because Strata's `GEN` protocol requires a positive integer, it uses the remaining engine context minus its eight-token safety margin. Reasoning and tool-call text both count toward any explicit client limit.
+- A rejected tool-only streaming turn is regenerated up to twice with a format reminder and the original offered tools. The rejected arguments are not replayed or logged, and incomplete or unoffered calls are never executed. A turn that already emitted a valid tool call is not regenerated, avoiding duplicate side effects. After two unsuccessful retries, the safe rejection text is returned to the client.
 - The bridge logs prompt excerpts to the systemd journal and may write full prompts to `/tmp/strata-badprompt-*` when generation stops at token zero. These can contain sensitive conversation data. Protect and rotate them; never commit them.
 - A bridge-only Python change needs a bridge restart; a model YAML template change may need a LocalAI restart. A Zoo Code UI run is necessary before claiming its display is fixed.
 - Strata can leave tokens queued after a cancelled generation. The bridge drains to `DONE` (or a bounded idle timeout) before accepting the next request.

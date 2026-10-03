@@ -42,6 +42,85 @@ class OutputBudgetTests(unittest.TestCase):
 
 
 class ToolCallStreamParserTests(unittest.TestCase):
+    def test_stream_retries_rejected_only_tool_turn_without_executing_partial_calls(self):
+        methods = next(n for n in module.body if isinstance(n, ast.ClassDef) and
+                       n.name == 'StrataBackend').body
+        stream = next(n for n in methods if isinstance(n, ast.FunctionDef) and n.name == '_stream')
+        tool_block = next(n for n in module.body if isinstance(n, ast.FunctionDef)
+                          and n.name == '_tool_system_block')
+        budget_fn = next(n for n in module.body if isinstance(n, ast.FunctionDef)
+                         and n.name == '_generation_limit')
+        pb = SimpleNamespace(Reply=lambda **kw: SimpleNamespace(**kw),
+                             ChatDelta=lambda **kw: SimpleNamespace(**kw),
+                             ToolCallDelta=lambda **kw: SimpleNamespace(**kw))
+        ns = dict(json=json, re=re, codecs=codecs, time=time, uuid=uuid,
+                  pb=pb, ToolCallStreamParser=Parser,
+                  IM_START='<|' + 'im_start' + '|>', IM_END='<|' + 'im_end' + '|>')
+        exec(compile(ast.Module(body=[tool_block, budget_fn, stream], type_ignores=[]),
+                     str(SOURCE), 'exec'), ns)
+
+        class Probe:
+            gen_lock = contextlib.nullcontext()
+            stop_ids = set()
+            think_close_ids = set()
+            engine = SimpleNamespace(max_context=1024)
+            def __init__(self, responses):
+                self.responses = responses
+                self.prompts = []
+                self.tok = SimpleNamespace(encode=self.encode,
+                                           token_bytes=lambda tid: self.response.encode())
+            def encode(self, prompt, parse_special):
+                self.prompts.append(prompt)
+                return [1]
+            def _check_identity(self, value):
+                pass
+            def _ensure_loaded(self):
+                pass
+            def _sampling_keys(self, opts):
+                return ''
+            def _generate(self, ids, max_new, keys):
+                self.response = self.responses.pop(0)
+                yield 2
+
+        Probe._stream = ns['_stream']
+        offered = {'type': 'function', 'function': {
+            'name': 'terminal', 'parameters': {'type': 'object',
+            'properties': {'command': {'type': 'string'}}}}}
+        opts = SimpleNamespace(ModelIdentity='', Prompt='User request',
+                               Tools=json.dumps([offered]), Tokens=100, StopPrompts=[])
+        valid = '<tool_call>{"name":"terminal","arguments":{"command":"pwd"}}</tool_call>'
+        invalid = '<tool_call>{"name":"invented","arguments":{"command":"DO-NOT-RUN"}}</tool_call>'
+        for bad in (invalid, '<tool_call>{"name":"terminal","arguments":{"command":"DO-NOT-RUN"}'):
+            with self.subTest(bad=bad[:35]):
+                probe = Probe([bad, valid])
+                replies = list(ns['_stream'](probe, opts))
+                calls = [t for r in replies for d in r.chat_deltas
+                         for t in getattr(d, 'tool_calls', [])]
+                content = ''.join(getattr(d, 'content', '') for r in replies for d in r.chat_deltas)
+                self.assertEqual(len(probe.prompts), 2)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0].name, 'terminal')
+                self.assertEqual(json.loads(calls[0].arguments), {'command': 'pwd'})
+                self.assertNotIn('Tool call rejected', content)
+                self.assertNotIn('DO-NOT-RUN', ''.join(probe.prompts))
+                self.assertIn('Retry', probe.prompts[1])
+
+        probe = Probe([invalid, invalid, invalid])
+        replies = list(ns['_stream'](probe, opts))
+        self.assertEqual(len(probe.prompts), 3, 'never retry without a bound')
+        self.assertFalse([t for r in replies for d in r.chat_deltas
+                          for t in getattr(d, 'tool_calls', [])])
+        self.assertEqual(''.join(getattr(d, 'content', '') for r in replies
+                                 for d in r.chat_deltas),
+                         'Tool call rejected: invalid format. Retry with an offered tool.')
+
+        probe = Probe([valid + invalid])
+        replies = list(ns['_stream'](probe, opts))
+        self.assertEqual(len(probe.prompts), 1,
+                         'a valid call has already been sent; never replay that turn')
+        self.assertEqual(len([t for r in replies for d in r.chat_deltas
+                              for t in getattr(d, 'tool_calls', [])]), 1)
+
     def test_zoo_function_parameter_variant_becomes_structured_tool_call(self):
         raw = ('Backend-Build ebenfalls erfolgreich. Jetzt der Frontend-Build:\n\n'
                '<tool_call>\n'
@@ -223,6 +302,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                 yield 1
                 for tid in range(2, 2 + len(chunks)):
                     yield tid
+        Probe._stream = ns['_stream']
         tools = [{'type': 'function', 'function': {
             'name': 'execute_command', 'parameters': {'type': 'object',
             'properties': {'command': {'type': 'string'},
