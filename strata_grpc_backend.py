@@ -345,23 +345,49 @@ class ToolCallStreamParser:
                     self.buf = self.buf[idx + len(self.t_open):]
                     self.mode = "block"
                     self.block = ""
+                    self.block_json = None
+                    self.block_string = False
+                    self.block_escape = False
                     continue
                 keep = self._prefix_suffix_len(self.buf, self.t_open)
                 if keep < len(self.buf):
                     out.append(("text", self.buf[:len(self.buf) - keep]))
                     self.buf = self.buf[len(self.buf) - keep:]
                 break
-            end = self.buf.find(self.t_close)
-            if end >= 0:
-                self.block += self.buf[:end]
-                self.buf = self.buf[end + len(self.t_close):]
+            # Only a delimiter OUTSIDE a JSON string ends the envelope.
+            # Keep lexical state across chunks (including escaped backslashes),
+            # otherwise documentation/file contents can split a valid call.
+            i = 0
+            closed = False
+            while i < len(self.buf):
+                if not self.block_string:
+                    if self.buf.startswith(self.t_close, i):
+                        closed = True
+                        break
+                    if (len(self.buf) - i < len(self.t_close) and
+                            self.t_close.startswith(self.buf[i:])):
+                        break  # incomplete envelope delimiter: wait for next chunk
+                ch = self.buf[i]
+                if self.block_json is None and not ch.isspace():
+                    self.block_json = ch == '{'
+                if self.block_json:
+                    if self.block_string:
+                        if self.block_escape:
+                            self.block_escape = False
+                        elif ch == '\\':
+                            self.block_escape = True
+                        elif ch == '"':
+                            self.block_string = False
+                    elif ch == '"':
+                        self.block_string = True
+                i += 1
+            self.block += self.buf[:i]
+            self.buf = self.buf[i:]
+            if closed:
+                self.buf = self.buf[len(self.t_close):]
                 self.mode = "text"
                 out.append(self._parse_block())
                 continue
-            keep = self._prefix_suffix_len(self.buf, self.t_close)
-            if keep < len(self.buf):
-                self.block += self.buf[:len(self.buf) - keep]
-                self.buf = self.buf[len(self.buf) - keep:]
             break
         return out
 

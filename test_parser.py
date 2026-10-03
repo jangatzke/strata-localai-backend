@@ -42,6 +42,53 @@ class OutputBudgetTests(unittest.TestCase):
 
 
 class ToolCallStreamParserTests(unittest.TestCase):
+    def test_json_string_delimiters_roundtrip_without_rejection_or_leak(self):
+        values = ['```json\n{"ok": true}\n```',
+                  'Literal </tool_call> inside a string',
+                  '```xml\n<tool_call>example</tool_call>\n```',
+                  'Escaped quote " and slash \\ followed by </tool_call>',
+                  'Two backslashes \\\\ then "</tool_call>" and Unicode ä']
+        specs = {'write_file': {'content': {'type': 'string'}}}
+        for value in values:
+            raw = '<tool_call>' + json.dumps({'name': 'write_file',
+                  'arguments': {'content': value}}) + '</tool_call>'
+            for size in (1, 2, 7, 31, len(raw)):
+                with self.subTest(value=value, size=size):
+                    result = events(raw, size=size, specs=specs)
+                    self.assertEqual([e[0] for e in result], ['tool'])
+                    self.assertEqual(json.loads(result[0][2]), {'content': value})
+
+    def test_delimiter_collision_at_every_single_chunk_boundary(self):
+        args = {'content': 'Quote " then \\ and </tool_call> plus ```\ntext',
+                'nested': {'items': ['</tool_call>', 42]}}
+        raw = '<tool_call>' + json.dumps({'name': 'write_file', 'arguments': args}) + '</tool_call>'
+        for split in range(len(raw) + 1):
+            parser = Parser({'write_file': {}})
+            result = parser.feed(raw[:split]) + parser.feed(raw[split:]) + parser.flush()
+            self.assertEqual([e[0] for e in result], ['tool'])
+            self.assertEqual(json.loads(result[0][2]), args)
+
+    def test_collision_state_resets_between_tool_blocks(self):
+        args = {'content': 'Literal </tool_call> and \\"'}
+        raw = '<tool_call>' + json.dumps({'name': 'write_file', 'arguments': args}) + '</tool_call>'
+        for size in (1, 7, len(raw) * 2):
+            result = events(raw * 2, size=size, specs={'write_file': {}})
+            self.assertEqual([e[0] for e in result], ['tool', 'tool'])
+            self.assertTrue(all(json.loads(e[2]) == args for e in result))
+
+    def test_collision_does_not_repair_incomplete_or_unoffered_write_calls(self):
+        args = {'content': 'Private value </tool_call> inside JSON'}
+        valid = '<tool_call>' + json.dumps({'name': 'write_file', 'arguments': args}) + '</tool_call>'
+        cases = [valid[:-len('</tool_call>')],
+                 valid.replace('write_file', 'unoffered_write'),
+                 valid.replace('inside JSON"', 'inside JSON'),
+                 valid.replace('"arguments":', '"arguments"')]
+        for raw in cases:
+            for size in (1, 7, len(raw)):
+                result = events(raw, size=size, specs={'write_file': {}})
+                self.assertEqual([e[0] for e in result], ['invalid_tool'])
+                self.assertNotIn('Private value', str(result))
+
     def test_stream_retries_rejected_only_tool_turn_without_executing_partial_calls(self):
         methods = next(n for n in module.body if isinstance(n, ast.ClassDef) and
                        n.name == 'StrataBackend').body
