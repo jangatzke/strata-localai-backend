@@ -320,6 +320,7 @@ class ToolCallStreamParser:
         self.buf = ""
         self.block = ""
         self.tool_specs = tool_specs or {}
+        self.last_rejection = ""
         self.t_open = chr(60) + "tool_call" + chr(62)
         # Qwen3 closes with the bracket-slash form, not an XML-style end tag
         self.t_close = chr(60) + "/" + "tool_call" + chr(62)
@@ -364,6 +365,21 @@ class ToolCallStreamParser:
             break
         return out
 
+    def _reject(self, block, reason):
+        """Record only structural metadata; tool arguments may contain secrets."""
+        fn = re.search(r'<function=([A-Za-z_][\w.-]*)>', block)
+        dialect = "xml" if fn else ("json" if block.lstrip().startswith("{") else "other")
+        name = fn.group(1) if fn else None
+        if not name and dialect == "json":
+            match = re.search(r'"name"\s*:\s*"([A-Za-z_][\w.-]*)"', block)
+            name = match.group(1) if match else None
+        offered = name if name in self.tool_specs else "unoffered-or-unknown"
+        params = len(re.findall(r'<parameter(?:=|\s+name=)', block))
+        self.last_rejection = (f"reason={reason} dialect={dialect} tool={offered} "
+                               f"parameter_count={params} chars={len(block)} "
+                               f"function_closed={'</function>' in block}")
+        return ("invalid_tool",)
+
     def _parse_block(self):
         block = self.block
         self.block = ""
@@ -371,7 +387,7 @@ class ToolCallStreamParser:
             d = json.loads(block.strip())
             name = d.get("name")
             if not isinstance(name, str) or name not in self.tool_specs:
-                return ("invalid_tool",)
+                return self._reject(block, "unoffered-json-tool")
             args = d.get("arguments", {})
             if not isinstance(args, str):
                 args = json.dumps(args, ensure_ascii=False)
@@ -385,7 +401,7 @@ class ToolCallStreamParser:
             alternate = self._parse_function_parameters(block)
             if alternate is not None:
                 return alternate
-            return ("invalid_tool",)
+            return self._reject(block, "unparseable-block")
 
     def _parse_function_parameters(self, block):
         fn = re.fullmatch(r"\s*<function=([A-Za-z_][\w.-]*)>(.*?)</function>\s*",
@@ -441,7 +457,7 @@ class ToolCallStreamParser:
         """Reject incomplete tool blocks; preserve ordinary trailing text."""
         out = []
         if self.mode == "block":
-            out.append(("invalid_tool",))
+            out.append(self._reject(self.block + self.buf, "incomplete-block"))
         elif self.buf:
             out.append(("text", self.buf))
         self.buf = ""
@@ -624,7 +640,8 @@ class StrataBackend(pb_grpc.BackendServicer):
             tools = []
             for ev in events:
                 if ev[0] == "invalid_tool":
-                    print("[strata-backend] rejected malformed or unoffered tool block",
+                    print("[strata-backend] rejected malformed or unoffered tool block: "
+                          + tool_parser.last_rejection,
                           flush=True)
                     rejected_tool = True
                     post_think = True

@@ -81,6 +81,20 @@ class ToolCallStreamParserTests(unittest.TestCase):
                 raw = '<tool_call>' + body + '</tool_call>'
                 self.assertEqual(events(raw, specs=specs), [('invalid_tool',)])
 
+    def test_rejection_diagnostic_exposes_shape_not_argument_values(self):
+        secret = 'do-not-log-this-secret'
+        parser = Parser({'attempt_completion': {'result': {'type': 'string'}}})
+        raw = ('<tool_call><function=attempt_completion>'
+               '<parameter=unexpected>' + secret + '</parameter>'
+               '</function></tool_call>')
+        self.assertEqual(parser.feed(raw), [('invalid_tool',)])
+        diagnostic = parser.last_rejection
+        self.assertIn('attempt_completion', diagnostic)
+        self.assertIn('xml', diagnostic)
+        self.assertNotIn(secret, diagnostic)
+        self.assertNotIn('unexpected', diagnostic)
+        self.assertEqual(parser.flush(), [])
+
     def test_incomplete_tool_block_is_rejected_not_shown(self):
         raw = '<tool_call><function=execute_command><parameter=command>pwd'
         self.assertEqual(events(raw, size=1, specs={'execute_command': {
