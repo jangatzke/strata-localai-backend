@@ -41,6 +41,24 @@ class OutputBudgetTests(unittest.TestCase):
             limit(0, 127995, 128000)
 
 
+class PredictReplyTests(unittest.TestCase):
+    def test_predict_preserves_structured_deltas_without_raw_tool_fallback(self):
+        methods = next(n for n in module.body if isinstance(n, ast.ClassDef)
+                       and n.name == 'StrataBackend').body
+        predict = next(n for n in methods if isinstance(n, ast.FunctionDef) and n.name == 'Predict')
+        pb = SimpleNamespace(Reply=lambda **kw: SimpleNamespace(**kw))
+        ns = {'pb': pb}
+        exec(compile(ast.Module(body=[predict], type_ignores=[]), str(SOURCE), 'exec'), ns)
+        for delta in (SimpleNamespace(content='', tool_calls=[SimpleNamespace(name='write_file', arguments='{}')]),
+                      SimpleNamespace(content='Tool call rejected: invalid format. Retry with an offered tool.')):
+            reply = SimpleNamespace(message=b'<tool_call>DO-NOT-PARSE</tool_call>',
+                                    tokens=1, prompt_tokens=5, chat_deltas=[delta])
+            probe = SimpleNamespace(_stream=lambda *a, **kw: iter([reply]))
+            result = ns['Predict'](probe, None, None)
+            self.assertEqual(getattr(result, 'chat_deltas', []), [delta])
+            self.assertNotIn(b'DO-NOT-PARSE', result.message)
+
+
 class ToolCallStreamParserTests(unittest.TestCase):
     def test_json_string_delimiters_roundtrip_without_rejection_or_leak(self):
         values = ['```json\n{"ok": true}\n```',
@@ -167,6 +185,51 @@ class ToolCallStreamParserTests(unittest.TestCase):
                          'a valid call has already been sent; never replay that turn')
         self.assertEqual(len([t for r in replies for d in r.chat_deltas
                               for t in getattr(d, 'tool_calls', [])]), 1)
+
+    def test_thinking_tool_examples_are_never_executable(self):
+        methods = next(n for n in module.body if isinstance(n, ast.ClassDef)
+                       and n.name == 'StrataBackend').body
+        stream = next(n for n in methods if isinstance(n, ast.FunctionDef) and n.name == '_stream')
+        helpers = [next(n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == name)
+                   for name in ('_tool_system_block', '_generation_limit')]
+        pb = SimpleNamespace(Reply=lambda **kw: SimpleNamespace(**kw),
+                             ChatDelta=lambda **kw: SimpleNamespace(**kw),
+                             ToolCallDelta=lambda **kw: SimpleNamespace(**kw))
+        ns = dict(json=json, re=re, codecs=codecs, time=time, uuid=uuid, pb=pb,
+                  ToolCallStreamParser=Parser,
+                  IM_START='<|' + 'im_start' + '|>', IM_END='<|' + 'im_end' + '|>')
+        exec(compile(ast.Module(body=helpers + [stream], type_ignores=[]), str(SOURCE), 'exec'), ns)
+        thought = 'Example: <tool_call>{"name":"terminal","arguments":{"command":"NEVER-RUN"}}</tool_call> and <tool_call>example</tool_call>'
+        answer = '<tool_call>{"name":"terminal","arguments":{"command":"pwd"}}</tool_call>'
+        chunks = [b'<think>'] + [c.encode() for c in thought] + [b'</think>'] + [c.encode() for c in answer]
+        class Probe:
+            gen_lock = contextlib.nullcontext()
+            stop_ids = set()
+            think_open_ids = {1000}
+            think_close_ids = {1001}
+            engine = SimpleNamespace(max_context=2048)
+            tok = SimpleNamespace(encode=lambda *a, **kw: [1],
+                                  token_bytes=lambda tid: chunks[0] if tid == 1000 else
+                                  b'</think>' if tid == 1001 else chunks[tid])
+            def _check_identity(self, value): pass
+            def _sampling_keys(self, opts): return ''
+            def _generate(self, *args):
+                yield 1000
+                yield from range(1, len(thought) + 1)
+                yield 1001
+                yield from range(len(thought) + 2, len(chunks))
+        tools = [{'type': 'function', 'function': {'name': 'terminal',
+                  'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}}}}]
+        opts = SimpleNamespace(ModelIdentity='', Prompt='Test', Tools=json.dumps(tools),
+                               Tokens=300, StopPrompts=[])
+        replies = list(ns['_stream'](Probe(), opts))
+        calls = [t for r in replies for d in r.chat_deltas for t in getattr(d, 'tool_calls', [])]
+        content = ''.join(getattr(d, 'content', '') for r in replies for d in r.chat_deltas)
+        reasoning = ''.join(getattr(d, 'reasoning_content', '') for r in replies for d in r.chat_deltas)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0].arguments), {'command': 'pwd'})
+        self.assertEqual(content, '')
+        self.assertIn(thought, reasoning)
 
     def test_zoo_function_parameter_variant_becomes_structured_tool_call(self):
         raw = ('Backend-Build ebenfalls erfolgreich. Jetzt der Frontend-Build:\n\n'
@@ -443,8 +506,11 @@ class ToolCallStreamParserTests(unittest.TestCase):
         exec(compile(ast.Module(body=[predict], type_ignores=[]), str(SOURCE), 'exec'), ns)
         Probe._stream = ns['_stream']
         result = ns['Predict'](Probe(), opts, None)
-        self.assertEqual(result.message, raw.encode(),
-                         'non-streaming Predict still needs raw text for LocalAI parsing')
+        self.assertEqual(result.message, b'',
+                         'non-streaming Predict must not reparse raw tool markup')
+        predict_calls = [t for d in result.chat_deltas for t in getattr(d, 'tool_calls', [])]
+        self.assertEqual(len(predict_calls), 1)
+        self.assertEqual(predict_calls[0].name, 'execute_command')
         opts.Tokens = 0
         probe = Probe()
         list(ns['_stream'](probe, opts))

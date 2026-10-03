@@ -580,6 +580,7 @@ class StrataBackend(pb_grpc.BackendServicer):
         # the thinking close token: after it, a leading blank run precedes the
         # actual answer; we suppress those newlines once (the reasoning itself
         # is not touched - LocalAI separates it on its side)
+        self.think_open_ids = set(tok.encode(chr(60) + "think" + chr(62), parse_special=True))
         self.think_close_ids = set(tok.encode(chr(60) + chr(47) + "think" + chr(62), parse_special=True))
         self.log_follower = EngineLogFollower(
             cfg.get("log"), cfg.get("forward_log_pattern", DEFAULT_LOG_PATTERN))
@@ -704,6 +705,7 @@ class StrataBackend(pb_grpc.BackendServicer):
         raw_sent = 0         # bytes of `raw` already sent as message deltas
         n = 0                # deltas yielded
         post_think = False   # True after the thinking close token
+        inside_think = False # explicit thinking is never executable tool markup
         started_text = False # False until the first non-newline char in the current phase
         cd_reason = ""       # reasoning routed via chat deltas
         cd_content = ""      # content routed via chat deltas
@@ -832,7 +834,10 @@ class StrataBackend(pb_grpc.BackendServicer):
                     except StopIteration as e:
                         finished = e.value or finished
                         break
+                    if tid in getattr(self, 'think_open_ids', set()):
+                        inside_think = True
                     if tid in self.think_close_ids:
+                        inside_think = False
                         # the thinking close marker routes to the reasoning
                         # stream; the blank run before the answer is suppressed
                         buf += self.tok.token_bytes(tid)
@@ -865,7 +870,11 @@ class StrataBackend(pb_grpc.BackendServicer):
                         continue          # the decoder is still buffering multibyte input
                     chunk = full[len(raw):]
                     raw = full
-                    rs_part, ct_part, tools = consume(chunk)
+                    if inside_think:
+                        # Tool examples quoted in reasoning are data, not calls.
+                        rs_part, ct_part, tools = chunk, "", []
+                    else:
+                        rs_part, ct_part, tools = consume(chunk)
                     cd_reason += rs_part
                     cd_content += ct_part
                     if tools or rs_part or ct_part:
@@ -902,7 +911,9 @@ class StrataBackend(pb_grpc.BackendServicer):
                 raise
         # trailing bytes that the incremental decoder still holds
         tail = dec.decode(bytes(buf), final=True)
-        if len(tail) > len(raw):
+        if inside_think:
+            rs_part, ct_part, tools = tail[len(raw):], "", []
+        elif len(tail) > len(raw):
             rs_part, ct_part, tools = consume(tail[len(raw):], closing=True)
         else:
             rs_part, ct_part, tools = consume("", closing=True)
@@ -956,14 +967,22 @@ class StrataBackend(pb_grpc.BackendServicer):
     def Predict(self, request, context):
         try:
             text_parts = []
+            chat_deltas = []
             tokens = 0
             prompt_tokens = 0
-            for reply in self._stream(request, streaming=False):
+            # Aggregate the streaming path so non-SSE requests share its
+            # safe raw suppression and bounded tool-only regeneration.
+            for reply in self._stream(request, streaming=True):
                 text_parts.append(reply.message.decode("utf-8", "replace"))
+                chat_deltas.extend(reply.chat_deltas)
                 tokens = max(tokens, reply.tokens)
                 prompt_tokens = reply.prompt_tokens
-            return pb.Reply(message="".join(text_parts).encode("utf-8"), tokens=tokens,
-                            prompt_tokens=prompt_tokens)
+            # Preserve the same structured contract as PredictStream. Dropping
+            # deltas lets LocalAI reparse raw reasoning/rejected tool markup.
+            text = (''.join(getattr(d, 'content', '') for d in chat_deltas) if chat_deltas
+                    else ''.join(text_parts))
+            return pb.Reply(message=text.encode("utf-8"), tokens=tokens,
+                            prompt_tokens=prompt_tokens, chat_deltas=chat_deltas)
         except Exception as e:
             if self.engine.alive():
                 self.engine.drain()
