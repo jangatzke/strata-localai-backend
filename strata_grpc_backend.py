@@ -375,9 +375,20 @@ class ToolCallStreamParser:
             name = match.group(1) if match else None
         offered = name if name in self.tool_specs else "unoffered-or-unknown"
         params = len(re.findall(r'<parameter(?:=|\s+name=)', block))
+        json_shape = ""
+        if dialect == "json":
+            try:
+                json.loads(block.strip())
+            except json.JSONDecodeError as exc:
+                # Decoder diagnostics are fixed strings and offsets, never payload.
+                json_shape = (f" json_error={exc.msg!r} pos={exc.pos} "
+                              f"line={exc.lineno} col={exc.colno} "
+                              f"newlines={block.count(chr(10))}")
+            except (ValueError, TypeError):
+                json_shape = " json_error=other"
         self.last_rejection = (f"reason={reason} dialect={dialect} tool={offered} "
                                f"parameter_count={params} chars={len(block)} "
-                               f"function_closed={'</function>' in block}")
+                               f"function_closed={'</function>' in block}{json_shape}")
         return ("invalid_tool",)
 
     def _recover_completion_result(self, block):
@@ -650,7 +661,7 @@ class StrataBackend(pb_grpc.BackendServicer):
                 prompt = prompt[:end] + "\n\n" + tools_text + prompt[end:]
             else:
                 prompt = head + "\n" + tools_text + IM_END + "\n" + prompt
-        print(f"[strata-backend] prompt({len(prompt)} chars): {prompt[:600]!r} ... TAIL: {prompt[-400:]!r}", flush=True)
+        print(f"[strata-backend] prompt chars={len(prompt)}", flush=True)
         ids = self.tok.encode(prompt, parse_special=True)
         if o.Tokens <= 0:
             self._ensure_loaded()  # READY supplies the actual engine context
@@ -815,15 +826,9 @@ class StrataBackend(pb_grpc.BackendServicer):
                     if tid in self.stop_ids:
                         print(f"[strata-test] stop_ids hit at token {tok_idx}: tid={tid}",
                               flush=True)
-                        if tok_idx == 0 and prompt:
-                            try:
-                                ts = time.strftime("%Y%m%d-%H%M%S")
-                                with open(f"/tmp/strata-badprompt-{ts}.txt", "w") as fh:
-                                    fh.write(prompt)
-                                print(f"[strata-test] dumped zero-token prompt to "
-                                      f"/tmp/strata-badprompt-{ts}.txt", flush=True)
-                            except OSError as e:
-                                print(f"[strata-test] prompt dump failed: {e}", flush=True)
+                        if tok_idx == 0:
+                            print("[strata-test] zero-token stop (prompt omitted)",
+                                  flush=True)
                         self.engine.stop()
                         self.engine.drain()
                         break

@@ -210,6 +210,13 @@ class ToolCallStreamParserTests(unittest.TestCase):
         self.assertNotIn(secret, diagnostic)
         self.assertNotIn('unexpected', diagnostic)
         self.assertEqual(parser.flush(), [])
+        json_parser = Parser({'terminal': {'command': {'type': 'string'}}})
+        malformed = ('<tool_call>{"name":"terminal","arguments":{"command":'
+                     '"' + secret + '"oops}}</tool_call>')
+        self.assertEqual(json_parser.feed(malformed), [('invalid_tool',)])
+        self.assertIn('json_error=', json_parser.last_rejection)
+        self.assertNotIn(secret, json_parser.last_rejection)
+        self.assertNotIn('oops', json_parser.last_rejection)
 
     def test_incomplete_tool_block_is_rejected_not_shown(self):
         raw = '<tool_call><function=execute_command><parameter=command>pwd'
