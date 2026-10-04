@@ -1062,13 +1062,11 @@ class StrataBackend(pb_grpc.BackendServicer):
                         inside_think = True
                     if tid in self.think_close_ids:
                         inside_think = False
-                        # the thinking close marker routes to the reasoning
-                        # stream; the blank run before the answer is suppressed
+                        # Raw compatibility consumers need the phase delimiter,
+                        # but ChatDelta already distinguishes reasoning/content.
+                        # Do not publish a structural token as visible reasoning.
                         chunk = dec.decode(self.tok.token_bytes(tid), final=False)
                         raw += chunk
-                        rep = send_events(chunk, "", None)
-                        if rep:
-                            yield rep
                         if (streaming and rs_sent == 0 and
                                 not cd_reason.replace("<think>", "").replace("</think>", "").strip()):
                             rs_sent = len(cd_reason)

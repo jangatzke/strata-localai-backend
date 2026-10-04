@@ -627,6 +627,35 @@ class ToolCallStreamParserTests(unittest.TestCase):
         replies = list(ns['_stream'](Probe(), opts))
         reasoning = ''.join(getattr(d, 'reasoning_content', '') for r in replies for d in r.chat_deltas)
         self.assertIn('Plan the next step', reasoning)
+        self.assertNotIn('</think>', reasoning)
+        # The legacy raw wire still carries its phase delimiter; structured
+        # reasoning must not contain the token that closed the phase.
+        tokens = [b'', b'Plan the next step', b'\n', b'</think>',
+                  b'\n', b'Answer']
+        for streaming in (True, False):
+            for offered in (json.dumps(tools), ''):
+                opts.Tools = offered
+                replies = list(ns['_stream'](Probe(), opts, streaming=streaming))
+                reasoning = ''.join(getattr(d, 'reasoning_content', '')
+                                    for r in replies for d in r.chat_deltas)
+                content = ''.join(getattr(d, 'content', '')
+                                  for r in replies for d in r.chat_deltas)
+                self.assertEqual(reasoning, 'Plan the next step\n')
+                self.assertEqual(content, 'Answer')
+
+        # Ordinary payload bytes that spell the delimiter are not control
+        # tokens, and string arguments must remain byte-for-byte intact.
+        tokens = [b'', b'Quote: </think>', b'\n', b'</think>',
+                  b'<tool_call>{"name":"update_todo_list",',
+                  b'"arguments":{"todos":"literal </think>"}}</tool_call>']
+        opts.Tools = json.dumps(tools)
+        replies = list(ns['_stream'](Probe(), opts))
+        reasoning = ''.join(getattr(d, 'reasoning_content', '')
+                            for r in replies for d in r.chat_deltas)
+        self.assertEqual(reasoning, 'Quote: </think>\n')
+        calls = [t for r in replies for d in r.chat_deltas
+                 for t in getattr(d, 'tool_calls', [])]
+        self.assertEqual(json.loads(calls[0].arguments), {'todos': 'literal </think>'})
 
 
 if __name__ == '__main__':
