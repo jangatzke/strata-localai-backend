@@ -2,7 +2,7 @@
 
 A Python external backend for [LocalAI](https://github.com/mudler/LocalAI) that runs the [Strata](https://github.com/Niko1221/Strata) inference engine and exposes it as an OpenAI-compatible chat model through LocalAI. The engine, model weights and tokenizer pack are **not** included.
 
-This repository captures the working bridge deployed for `qwen3.8-flash-next-strata`. It is tied to Strata's `--serve` stdin/stdout protocol (`READY`, `GEN`, `T`, `DONE`, `STOP`, `QUIT`) and LocalAI's gRPC `backend.Backend` protocol; it is not a general-purpose LocalAI backend for arbitrary engines.
+This repository captures the working bridge deployed for `qwen3.8-flash-next-strata`. It is tied to Strata's `--serve` stdin/stdout protocol (legacy `GEN` or two-slot `BGEN` mode) and LocalAI's gRPC `backend.Backend` protocol; it is not a general-purpose LocalAI backend for arbitrary engines.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ OpenAI-compatible client (e.g. Zoo Code)
     → Strata engine --serve + model pack/tokenizer
 ```
 
-`LoadModel` starts Strata and waits for `READY`; `Predict` and `PredictStream` tokenize ChatML prompts and process generated token IDs; `Free` stops the engine and releases GPU/RAM. Streaming tool calls are converted into structured `ChatDelta.tool_calls`. The parser accepts the native JSON tool format and a schema-bound XML-like fallback seen in Zoo Code. Malformed tool-call *blocks* fail closed: no guessed tool execution or raw block in streaming content. This does not guarantee that a model can never produce some other unrecognized syntax.
+`LoadModel` starts Strata and waits for `READY`; `Predict` and `PredictStream` tokenize ChatML prompts and process generated token IDs; `Free` stops the engine and releases GPU/RAM. Set top-level `"parallel": 2` to enable exactly two concurrent bridge request slots. The bridge appends `--batch 2` unless engine `args` already contain upstream `--batch` or `--slots` syntax, which is preserved unchanged. If `parallel` is absent or `1`, the bridge retains serialized `GEN`/`GENI` behavior. Other root-level values are rejected, and batch startup fails unless the engine reports at least two slots in `INFO batch_slots=N`. Batch requests use `BGEN`/`BGENI`, `BADM`, `BT`, `BDONE`, and request-scoped `BSTOP`. Streaming tool calls are converted into structured `ChatDelta.tool_calls`. The parser accepts the native JSON tool format and a schema-bound XML-like fallback seen in Zoo Code. Malformed tool-call *blocks* fail closed: no guessed tool execution or raw block in streaming content. This does not guarantee that a model can never produce some other unrecognized syntax.
 
 ## Files
 
@@ -66,7 +66,7 @@ Place `qwen3.8-flash-next-strata.yaml` in LocalAI's model directory and ensure i
 Unit regressions do **not** require a running engine:
 
 ```bash
-python3 -m unittest -q test_parser test_recovery
+python3 -m unittest -q test_parser test_recovery test_batch test_vision
 python3 -m py_compile strata_grpc_backend.py
 ```
 
@@ -96,6 +96,7 @@ The history probe checks five consecutive non-streaming completions, feeding eac
 - Diagnostics log prompt length and fixed parser-state/shape metadata only, not prompt excerpts, argument values or full failed conversations. Preserve this privacy boundary when adding probes.
 - A bridge-only Python change needs a bridge restart; a model YAML template change may need a LocalAI restart. A Zoo Code UI run is necessary before claiming its display is fixed.
 - Strata can leave tokens queued after a cancelled generation. The bridge drains to `DONE` (or a bounded idle timeout) before accepting the next request.
+- In `parallel: 2` mode, stdout is dispatched by slot: serialized admission consumes only its untagged compatibility output through matching `BADM`, while `BT`/`BDONE` are routed to per-slot queues. Cancellation sends `BSTOP <slot>` and requires that slot's `BDONE` before the numeric slot can be reused. Vision requests use `BGENI` and keep their request embedding file until that slot completes or drains.
 - The service expects generated `backend_pb2.py` and `backend_pb2_grpc.py` beside the bridge. They are intentionally not committed.
 
 ## Third-party protocol notice

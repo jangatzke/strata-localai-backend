@@ -5,9 +5,9 @@ Implements LocalAI's backend.Backend proto. Model loading / unloading:
 
   LoadModel -> spawns the Strata engine (`strata --serve ...`) with the args
               from the JSON config; waits for the engine's READY line.
-  Predict / PredictStream -> tokenizes the prompt with the pack's tokenizer,
-              writes a `GEN <max_new> <sampling keys> <ids>` line to the
-              engine's stdin, streams `T <id>` lines back out as Reply chunks.
+  Predict / PredictStream -> tokenizes the prompt with the pack's tokenizer;
+              uses legacy GEN/T/DONE by default or two-slot BGEN/BT/BDONE when
+              the config explicitly sets parallel=2.
   Free     -> sends QUIT to the engine and waits for it to exit, releasing
               all GPU/RAM so LocalAI can load other models.
 
@@ -111,15 +111,43 @@ class Engine:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        self.parallel = int(cfg.get("parallel", 1))
+        if self.parallel not in (1, 2):
+            raise ValueError("parallel must be 1 or 2")
         self.log_path = cfg.get("log")
         self.proc = None
-        self.lines = None
+        self.lines = queue.Queue()
         self.pump = None
         self.ended = True
         self.max_context = 0
         self.can_stop = False
         self.info = {}
         self.log = None
+        self.send_lock = threading.Lock()
+        self.admission_lock = threading.Lock()
+        self.slot_lines = {slot: queue.Queue() for slot in range(self.parallel)}
+        self.free_slots = queue.Queue()
+        for slot in range(self.parallel):
+            self.free_slots.put(slot)
+
+    def command_args(self, base: list[str]) -> list[str]:
+        """Add the engine batch switch only for explicit parallel mode."""
+        args = list(base)
+        has_upstream_slots = any(arg in ("--batch", "--slots") or
+                                 arg.startswith(("--batch=", "--slots=")) for arg in args)
+        if self.parallel == 2 and not has_upstream_slots:
+            args += ["--batch", "2"]
+        return args
+
+    def available_slots(self) -> int:
+        return self.free_slots.qsize()
+
+    def validate_batch_slots(self):
+        if self.parallel != 2:
+            return
+        reported = self.info.get("batch_slots")
+        if not isinstance(reported, int) or reported < 2:
+            raise EngineError(f"parallel=2 requires engine INFO batch_slots>=2; got batch_slots={reported}")
 
     def _env(self) -> dict:
         env = dict(os.environ)
@@ -143,13 +171,18 @@ class Engine:
         self.ended = True
         self.max_context = 0
         self.can_stop = False
+        self.info = {}
         self.log = open(self.log_path, "a", encoding="utf-8") if self.log_path else subprocess.DEVNULL
-        args = [self.cfg["exe"], "--serve", *self.cfg["args"]]
+        args = self.command_args([self.cfg["exe"], "--serve", *self.cfg["args"]])
         self.proc = subprocess.Popen(
             args, cwd=self.cfg.get("cwd") or ".", stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8",
             bufsize=1, env=self._env())
         self.lines = queue.Queue()
+        self.slot_lines = {slot: queue.Queue() for slot in range(self.parallel)}
+        self.free_slots = queue.Queue()
+        for slot in range(self.parallel):
+            self.free_slots.put(slot)
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
         deadline = time.time() + READY_TIMEOUT_S
@@ -173,32 +206,59 @@ class Engine:
                 self.ended = False
                 if self.max_context <= 0:
                     raise EngineError("the engine reported no context")
+                self.validate_batch_slots()
                 return
         raise EngineError(f"the engine did not become READY within {READY_TIMEOUT_S}s")
 
     def _pump(self):
         proc, q = self.proc, self.lines
         for line in proc.stdout:
-            q.put(line)
+            self._route_line(line)
         if self.proc is proc:
             self.ended = True
         q.put(None)
+        if self.parallel == 2:
+            for target in self.slot_lines.values():
+                target.put(None)
+
+    def _route_line(self, line: str):
+        """Dispatch tagged batch output without letting requests steal tokens."""
+        if self.parallel == 2 and line.startswith(("BT ", "BDONE ")):
+            parts = line.split()
+            try:
+                slot = int(parts[1])
+                target = self.slot_lines[slot]
+            except (ValueError, IndexError, KeyError):
+                self.lines.put("ERR malformed batch output: " + line.strip())
+                return
+            target.put(line)
+            return
+        if line.startswith("INFO "):
+            for kv in line.split()[1:]:
+                k, _, v = kv.partition("=")
+                self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+        self.lines.put(line)
 
     def _send(self, line: str):
         if not self.alive():
             raise EngineError("the engine is not running")
-        self.proc.stdin.write(line + "\n")
-        self.proc.stdin.flush()
+        with self.send_lock:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
 
-    def stop(self):
+    def stop(self, slot=None):
         """Ask the engine to abort the current request mid-generation."""
         if self.alive() and self.can_stop:
             try:
-                self._send("STOP")
+                if self.parallel == 2:
+                    if slot is not None:
+                        self._send(f"BSTOP {slot}")
+                else:
+                    self._send("STOP")
             except Exception:
                 pass
 
-    def drain(self, timeout_s: float = 120.0):
+    def drain(self, timeout_s: float = 120.0, slot=None):
         """Discard leftovers of an aborted generation.
 
         After STOP the engine still emits its remaining `T` lines and the
@@ -206,32 +266,149 @@ class Engine:
         read the previous conversation's tokens (lost step), so every abort
         path drains until DONE (or a bounded timeout) before returning.
         """
-        if self.lines is None:
+        if self.parallel == 2:
+            if slot is None:
+                return
+            source = self.slot_lines[slot]
+            terminal = "BDONE"
+        else:
+            source = self.lines
+            terminal = "DONE"
+        if source is None:
             return
         deadline = time.time() + timeout_s
         n = 0
         idle = 0
+        drained_terminal = False
         while time.time() < deadline:
             if not self.alive():
                 break
             try:
-                line = self.lines.get(timeout=1.0)
+                line = source.get(timeout=min(1.0, max(0.001, deadline - time.time())))
                 idle = 0
             except queue.Empty:
                 # nothing pending for a moment; a few idle seconds mean the
                 # engine has nothing queued anymore (a missing DONE is fine)
                 idle += 1
-                if idle >= 3:
+                if self.parallel == 1 and idle >= 3:
                     break
                 continue
             if line is None:
                 break
-            if line.startswith("DONE") or line.startswith("ERR"):
+            if line.startswith(terminal) or line.startswith("ERR"):
                 n += 1
+                drained_terminal = True
                 break
             n += 1
         if n:
-            print(f"[strata-backend] drain: discarded {n} leftover engine lines", flush=True)
+            scope = f" for slot {slot}" if slot is not None else ""
+            print(f"[strata-backend] drain: discarded {n} leftover engine lines{scope}", flush=True)
+        if self.parallel == 2 and self.alive() and not drained_terminal:
+            raise EngineError(f"batch slot {slot} did not drain safely without BDONE")
+
+    def batch_generate(self, max_new, keys, ids, embeddings=None):
+        """Admit and serve one request on an isolated Strata batch slot."""
+        if self.parallel != 2:
+            raise EngineError("batch generation requires parallel=2")
+        slot = self.free_slots.get()
+        admitted = completed = False
+        started = time.time()
+        try:
+            command = "BGENI" if embeddings is not None else "BGEN"
+            image_arg = f" {embeddings}" if embeddings is not None else ""
+            line = (f"{command} {slot} {max_new}{keys}{image_arg} "
+                    f"{','.join(map(str, ids))}")
+            # BGEN admission is serialized by Strata. Its untagged T/DONE
+            # compatibility output must be consumed here, never by active slots.
+            with self.admission_lock:
+                self._send(line)
+                deadline = time.time() + GEN_TIMEOUT_S
+                admission_tokens = []
+                admission_done = False
+                serial_fallback = None
+                while True:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise EngineError(f"batch admission timed out for slot {slot}")
+                    try:
+                        response = self.lines.get(timeout=min(1.0, remaining))
+                    except queue.Empty:
+                        if not self.alive():
+                            raise EngineError("the engine died during batch admission")
+                        continue
+                    if response is None:
+                        raise EngineError("the engine died during batch admission")
+                    if response.startswith("BADM "):
+                        parts = response.split()
+                        if len(parts) < 3 or int(parts[1]) != slot:
+                            raise EngineError("batch admission returned the wrong slot")
+                        if parts[2] == "1":
+                            admitted = True
+                        elif parts[2] == "0" and admission_done:
+                            # A non-admitted request completed synchronously
+                            # through the preceding legacy T/DONE stream.
+                            serial_fallback = admission_tokens
+                        else:
+                            raise EngineError(f"batch admission rejected slot {slot}")
+                        break
+                    if response.startswith("ERR"):
+                        raise EngineError(response.strip())
+                    if response.startswith("T "):
+                        admission_tokens.append(int(response.split()[1]))
+                    elif response.startswith("DONE"):
+                        admission_done = True
+                    # PP and INFO also belong to serialized admission.
+
+            if serial_fallback is not None:
+                for token in serial_fallback:
+                    yield token
+                completed = True
+                return {"tokens": len(serial_fallback), "elapsed": time.time() - started,
+                        "reason": "serial-fallback"}
+
+            n = 0
+            # BGEN reads the prompt as a one-token legacy GEN admission. That
+            # first T token is part of the response even when BADM continues
+            # decoding in the selected batch slot.
+            for token in admission_tokens:
+                n += 1
+                yield token
+            while True:
+                if time.time() - started > GEN_TIMEOUT_S:
+                    raise EngineError(f"generation timed out for slot {slot}")
+                try:
+                    response = self.slot_lines[slot].get(timeout=1.0)
+                except queue.Empty:
+                    if not self.alive():
+                        raise EngineError("the engine died mid-generation")
+                    continue
+                if response is None:
+                    raise EngineError("the engine died mid-generation")
+                if response.startswith("BT "):
+                    n += 1
+                    yield int(response.split()[2])
+                elif response.startswith("BDONE "):
+                    parts = response.split(maxsplit=5)
+                    completed = True
+                    return {"tokens": n,
+                            "generated": int(parts[2]) if len(parts) > 2 else n,
+                            "reason": parts[3] if len(parts) > 3 else "",
+                            "engine_ms": float(parts[4]) if len(parts) > 4 else 0.0,
+                            "elapsed": time.time() - started}
+                elif response.startswith("ERR"):
+                    raise EngineError(response.strip())
+        finally:
+            if admitted and not completed:
+                self.stop(slot)
+                self.drain(slot=slot)
+            # A rejected admission cannot have active output, but remove any
+            # malformed/stale tagged lines before this numeric slot is reused.
+            while True:
+                try:
+                    self.slot_lines[slot].get_nowait()
+                except queue.Empty:
+                    break
+            self.free_slots.put(slot)
 
     def free(self):
         """QUIT the engine and release GPU/RAM."""
@@ -877,7 +1054,9 @@ class StrataBackend(pb_grpc.BackendServicer):
         self.engine = Engine(cfg)
         self.vision = None
         self.vision_cfg = cfg.get("vision")
-        self.gen_lock = threading.Semaphore(1)   # one generation at a time
+        # Legacy GEN stays serialized; explicit parallel=2 mirrors Strata's
+        # two BGEN slots and admits at most two request transactions.
+        self.gen_lock = threading.Semaphore(getattr(self.engine, "parallel", 1))
         self.load_lock = threading.Lock()
         # stop markers: ChatML frame tokens plus the engine's end-of-text token
         stop_text = cfg.get("stop_tokens") or [
@@ -930,10 +1109,17 @@ class StrataBackend(pb_grpc.BackendServicer):
             return "loaded"
 
     def free(self):
-        self.engine.free()
-        if self.vision is not None:
-            self.vision.close()
-            self.vision = None
+        permits = getattr(self.engine, "parallel", 1)
+        for _ in range(permits):
+            self.gen_lock.acquire()
+        try:
+            self.engine.free()
+            if self.vision is not None:
+                self.vision.close()
+                self.vision = None
+        finally:
+            for _ in range(permits):
+                self.gen_lock.release()
 
     def _prepare_images(self, sources, ids):
         if not sources:
@@ -989,8 +1175,32 @@ class StrataBackend(pb_grpc.BackendServicer):
         return keys
 
     def _generate(self, ids, max_new, keys, embeddings=None):
-        """Run one GEN/GENI request; yields token ids; returns metadata at the end."""
+        """Run one legacy or batch request; yield token ids and return metadata."""
         self._ensure_loaded()
+        if getattr(self.engine, "parallel", 1) == 2:
+            command = "BGENI" if embeddings is not None else "BGEN"
+            print(f"[strata-backend] {command}: {len(ids)} prompt tokens, "
+                  f"max_new={max_new}{keys or ' (engine defaults)'}", flush=True)
+            started = time.time()
+            n = 0
+            batch = self.engine.batch_generate(max_new, keys, ids, embeddings)
+            try:
+                while True:
+                    try:
+                        tid = batch.send(None)
+                    except StopIteration as exc:
+                        result = exc.value or {"tokens": n, "elapsed": time.time() - started}
+                        elapsed = result.get("elapsed", time.time() - started)
+                        if n > 0 and elapsed > 0:
+                            print(f"[strata-backend] BGEN done: {n} tokens in {elapsed:.1f}s "
+                                  f"({n / elapsed:.1f} tok/s)", flush=True)
+                        return result
+                    if n == 0:
+                        print("[strata-engine-pp] DECODE_START", flush=True)
+                    n += 1
+                    yield tid
+            finally:
+                batch.close()
         command = "GENI" if embeddings else "GEN"
         image_arg = f" {embeddings}" if embeddings else ""
         gen_line = f"{command} {max_new}{keys}{image_arg} {','.join(map(str, ids))}"
@@ -1265,8 +1475,10 @@ class StrataBackend(pb_grpc.BackendServicer):
                         if tok_idx == 0:
                             print("[strata-test] zero-token stop (prompt omitted)",
                                   flush=True)
-                        self.engine.stop()
-                        self.engine.drain()
+                        gen.close()
+                        if getattr(self.engine, "parallel", 1) == 1:
+                            self.engine.stop()
+                            self.engine.drain()
                         break
                     tok_idx += 1
                     # Incremental decoders receive NEW bytes exactly once.
@@ -1301,8 +1513,10 @@ class StrataBackend(pb_grpc.BackendServicer):
                             ct_part = cd_content[ct_sent:]
                             rep = make_reply(rs_part, ct_part, tools if cut is None else None)
                             yield rep
-                            self.engine.stop()
-                            self.engine.drain()
+                            gen.close()
+                            if getattr(self.engine, "parallel", 1) == 1:
+                                self.engine.stop()
+                                self.engine.drain()
                             # Finalize the parser and validate this attempt just
                             # as on engine EOF; a stop prompt is not acceptance.
                             break
@@ -1313,8 +1527,10 @@ class StrataBackend(pb_grpc.BackendServicer):
                         if rep:
                             yield rep
             except GeneratorExit:
-                self.engine.stop()
-                self.engine.drain()
+                gen.close()
+                if getattr(self.engine, "parallel", 1) == 1:
+                    self.engine.stop()
+                    self.engine.drain()
                 raise
             finally:
                 if embeddings is not None:
