@@ -1,5 +1,6 @@
 {
   "model_name": "qwen3.8-flash-next-strata",
+  "tool_call_format": "native_xml",
   "strata_repo_tools": "/home/jan/strata/Strata/tools",
   "exe": "/home/jan/strata/Strata/engine/strata",
   "args": [

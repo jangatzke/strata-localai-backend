@@ -66,7 +66,7 @@ Place `qwen3.8-flash-next-strata.yaml` in LocalAI's model directory and ensure i
 Unit regressions do **not** require a running engine:
 
 ```bash
-python3 -m unittest -q test_parser
+python3 -m unittest -q test_parser test_recovery
 python3 -m py_compile strata_grpc_backend.py
 ```
 
@@ -74,19 +74,26 @@ With both the bridge and LocalAI running:
 
 ```bash
 LOCALAI_BASE_URL=http://YOUR_LOCALAI_HOST:8081/v1 python3 test_live_stream.py
+LOCALAI_BASE_URL=http://YOUR_LOCALAI_HOST:8081/v1 python3 test_live_history.py
 ```
 
 The smoke test checks for `finish_reason: tool_calls`, an offered `update_todo_list` call, and no raw tool markup in SSE content. It does not force the model to reproduce every malformed dialect. Also verify a non-streaming completion and a follow-up turn containing the tool result for your client. Bridge status: `systemctl status strata-localai-backend`; logs: `journalctl -u strata-localai-backend -f`. The engine may take tens of seconds to load on the first request.
 
+The history probe checks five consecutive non-streaming completions, feeding each actual assistant toolcall back into the next request with an explicit harness message stating that it was **not executed**. It verifies exact Unicode arguments and offered names without performing any file writes. `LOCALAI_MODEL` can select the model; optional `LIVE_HISTORY_RESULTS` stores only verification metadata, not arguments or session content. These fixtures do not replace a long real Telegram/Zoo session.
+
 ## Operational notes
 
 - Output length: a positive client `max_tokens` is passed through unchanged. When omitted or non-positive, the bridge does not impose a fixed output budget; because Strata's `GEN` protocol requires a positive integer, it uses the remaining engine context minus its eight-token safety margin. Reasoning and tool-call text both count toward any explicit client limit.
-- A rejected tool-only streaming turn is regenerated up to twice with a format reminder and the original offered tools. The rejected arguments are not replayed or logged, and incomplete or unoffered calls are never executed. A turn that already emitted a valid tool call is not regenerated, avoiding duplicate side effects. After two unsuccessful retries, the safe rejection text is returned to the client. Rejections include only fixed shape diagnostics (dialect, offered name, decoder error/offset), never argument values.
+- Tool-enabled turns are buffered until validation completes. Rejected turns are regenerated up to twice even when they contain a prose preamble. Failed prose/arguments are discarded, not replayed or logged. An exact standalone legacy rejection-text echo also triggers recovery. If any valid calls exist, they are published once; invalid neighbors are omitted and that turn is never regenerated. If all three attempts fail, gRPC returns an actual error, not a normal assistant rejection answer. Rejections include only fixed shape diagnostics (dialect, offered name, decoder error/offset), never argument values. Buffering delays tool-enabled output until the turn is complete; no-tools text still streams normally.
 - Tool envelope boundaries are JSON-string-aware: a closing tool-call marker inside a JSON string (including escaped quotes/backslashes, Markdown fences and arbitrary stream chunk boundaries) remains argument data. Only a marker outside a string closes the envelope; incomplete JSON still fails closed. String contents are never repaired by this boundary scanner.
 - Explicit thinking phases bypass the tool parser. Tool examples in reasoning are never executable and cannot switch the reply into content/rejection mode.
-- Non-streaming `Predict` aggregates the same safe path as `PredictStream`, returns structured chat deltas, and suppresses raw tool/argument markup instead of asking LocalAI to reparse it. Both paths share bounded tool-only regeneration; neither regenerates a turn after a valid call was emitted.
-- Direct Strata uses a structured function/parameter template and parser. The bridge injects a JSON tool contract and retains a schema-bound XML-like fallback for Zoo Code. These paths are not equivalent; a bridge rejection alone is not evidence of a model or context-length defect.
-- The bridge logs prompt excerpts to the systemd journal and may write full prompts to `/tmp/strata-badprompt-*` when generation stops at token zero. These can contain sensitive conversation data. Protect and rotate them; never commit them.
+- Non-streaming `Predict` aggregates the same safe path as `PredictStream`, returns structured chat deltas, and suppresses raw tool/argument markup instead of asking LocalAI to reparse it. Both paths share bounded transactional recovery; neither regenerates a turn containing a valid call.
+- Native XML boundaries walk function/parameter structure incrementally, preserving literal closing tags inside string values. Strings lose only the template's one outer newline at each end, not significant whitespace. Offered functions accept empty arguments when their schema has no required parameters. Missing required parameters, conflicting duplicates, unknown tools/parameters, malformed structure and truncated calls remain fail-closed.
+- `tool_call_format: native_xml` uses the active Strata pack's function/parameter dialect in both initial and recovery prompts; absent configuration retains the legacy `json` contract. The example enables `native_xml`. The LocalAI template marks API tool-history entries with `<bridge_tool_history>`; Python renders those entries in the configured dialect, preserving integer precision and raw string whitespace. User examples are not rewritten. Native assistant prefill ends in `<think>\n`, and stream parsing starts inside that thinking phase. Keep the bridge configuration and model template consistent.
+- Feed each new token byte block to the incremental UTF-8 decoder exactly once and finalize with empty input. Re-feeding cumulative bytes corrupts Unicode split across token boundaries.
+- Native/XML calls with non-whitespace suffix text invalidate the whole buffered turn, including provisionally parsed calls. Such text may be the remainder of a string whose literal closing-tag sequence was mistaken for structure. Recovery regenerates only this unpublished turn; exhaustion returns an RPC error without publishing a truncated writing call. This applies to the native contract and the XML fallback, while ordinary JSON-call neighbor handling remains unchanged. Raw native strings remain an inherently ambiguous encoding; do not claim every literal delimiter sequence can be safely represented.
+- Live validation is not a blanket guarantee: three API-only probes produced exact arguments after the native-contract change. An additional adversarial tool-history fixture produced a structured call but a non-exact file-content argument; that discrepancy and a long real Telegram continuation remain unverified. No generated probe tool was executed. A bridge rejection alone is not evidence of a model or context-length defect.
+- Diagnostics log prompt length and fixed parser-state/shape metadata only, not prompt excerpts, argument values or full failed conversations. Preserve this privacy boundary when adding probes.
 - A bridge-only Python change needs a bridge restart; a model YAML template change may need a LocalAI restart. A Zoo Code UI run is necessary before claiming its display is fixed.
 - Strata can leave tokens queued after a cancelled generation. The bridge drains to `DONE` (or a bounded idle timeout) before accepting the next request.
 - The service expects generated `backend_pb2.py` and `backend_pb2_grpc.py` beside the bridge. They are intentionally not committed.

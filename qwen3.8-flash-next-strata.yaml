@@ -39,8 +39,8 @@ template:
     {{ .Content }}
     </tool_response><|im_end|>{{ else }}<|im_start|>{{ .RoleName }}
     {{ .Content }}
-    {{ if .FunctionCall }}{{ range .FunctionCall }}<tool_call>
+    {{ if .FunctionCall }}{{ range .FunctionCall }}<bridge_tool_history>
     {"name": "{{ .FunctionCall.Name }}", "arguments": {{ .FunctionCall.Arguments }}}
-    </tool_call>{{ end }}{{ end }}<|im_end|>{{ end }}
+    </bridge_tool_history>{{ end }}{{ end }}<|im_end|>{{ end }}
   chat: |
     {{ .Input }}<|im_start|>assistant

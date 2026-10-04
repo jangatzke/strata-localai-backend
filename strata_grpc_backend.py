@@ -44,6 +44,10 @@ READY_TIMEOUT_S = 1200   # engine load takes minutes (experts + PLE)
 GEN_TIMEOUT_S = 3600     # per-request hard ceiling
 
 
+class ToolFormatError(RuntimeError):
+    """A tool-enabled turn failed closed before any calls were published."""
+
+
 class EngineLogFollower:
     """Tails the engine's log file and mirrors interesting lines to stdout.
 
@@ -248,12 +252,12 @@ class Engine:
             self.can_stop = False
 
 
-def _tool_system_block(tools_json: str) -> str:
-    """Build the Qwen3-native system block describing available tools.
+def _tool_system_block(tools_json: str, dialect='json') -> str:
+    """Describe offered tools in the configured generation dialect.
 
-    LocalAI does not inject tool definitions for custom chat templates, so the
-    bridge prepends them itself. The model is trained to answer with
-    <tool_call>{"name": ..., "arguments": {...}}</tool_call> blocks.
+    LocalAI does not inject definitions for this custom chat template.
+    native_xml matches the active Strata pack; json retains compatibility
+    with deployments using the older bridge-specific contract.
     """
     try:
         tools = json.loads(tools_json)
@@ -288,6 +292,26 @@ def _tool_system_block(tools_json: str) -> str:
             specs.append(json.dumps(t, ensure_ascii=False))
     if not specs:
         return ""
+    if dialect == 'native_xml':
+        return ('# Tools\n\nYou have access to the following functions:\n\n<tools>\n' +
+                '\n'.join(specs) + '\n</tools>\n\n'
+                'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
+                '<tool_call>\n<function=example_function_name>\n'
+                '<parameter=example_parameter_1>\nvalue_1\n</parameter>\n'
+                '<parameter=example_parameter_2>\nThis is the value for the second parameter\n'
+                'that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n'
+                '<IMPORTANT>\nReminder:\n'
+                '- Function calls MUST follow the specified format: an inner <function=...></function> '
+                'block must be nested within <tool_call></tool_call> XML tags\n'
+                '- Required parameters MUST be specified\n'
+                '- Preserve literal string values exactly, including Unicode, spaces, newlines and '
+                'tag-looking text. String values are raw text, NOT XML documents: do not XML-escape '
+                'them, add JSON quotes, replace closing tags, or remove text. Place one formatting '
+                'newline before and after each parameter value, in addition to any newlines in the value.\n'
+                '- You may provide optional reasoning for your function call in natural language '
+                'BEFORE the function call, but NOT after\n'
+                '- If there is no function call available, answer the question like normal with your '
+                'current knowledge and do not tell the user about function calls\n</IMPORTANT>')
     return (
         "# Tools\n\n"
         "You may call one or more functions to assist with the user query.\n\n"
@@ -306,6 +330,54 @@ def _tool_system_block(tools_json: str) -> str:
     )
 
 
+def _native_tool_history(prompt, dialect='native_xml'):
+    """Render explicitly marked API tool history, not arbitrary chat examples.
+
+    Decode in Python to retain integer precision and raw string whitespace.
+    No values from history are logged or executed.
+    """
+    opening, closing = '<bridge_tool_history>', '</bridge_tool_history>'
+    decoder = json.JSONDecoder()
+
+    def frame(match):
+        text = match.group(1)
+        out, pos = [], 0
+        while True:
+            start = text.find(opening, pos)
+            if start < 0:
+                out.append(text[pos:])
+                break
+            out.append(text[pos:start])
+            index = start + len(opening)
+            while index < len(text) and text[index].isspace():
+                index += 1
+            try:
+                call, end = decoder.raw_decode(text, index)
+                while end < len(text) and text[end].isspace():
+                    end += 1
+                name, args = call['name'], call['arguments']
+                if (not text.startswith(closing, end) or not isinstance(args, dict) or
+                        not isinstance(name, str) or not re.fullmatch(r'[A-Za-z_][\w.-]*', name) or
+                        any(not isinstance(k, str) or not re.fullmatch(r'[A-Za-z_][\w.-]*', k) for k in args)):
+                    raise ValueError
+            except (ValueError, TypeError, KeyError):
+                raise ToolFormatError('Invalid marked tool history') from None
+            if dialect == 'native_xml':
+                body = '<tool_call>\n<function=' + name + '>\n'
+                for key, value in args.items():
+                    rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                    body += '<parameter=' + key + '>\n' + rendered + '\n</parameter>\n'
+                body += '</function>\n</tool_call>'
+            else:
+                body = '<tool_call>\n' + json.dumps(call, ensure_ascii=False) + '\n</tool_call>'
+            out.append(body)
+            pos = end + len(closing)
+        return IM_START + 'assistant\n' + ''.join(out) + IM_END
+
+    return re.sub(re.escape(IM_START) + r'assistant\n(.*?)' + re.escape(IM_END),
+                  frame, prompt, flags=re.DOTALL)
+
+
 class ToolCallStreamParser:
     """Incremental parser that splits tool_call JSON blocks out of the stream.
 
@@ -315,11 +387,15 @@ class ToolCallStreamParser:
     could be the start of the opening tag are held back until decided.
     """
 
-    def __init__(self, tool_specs=None):
+    def __init__(self, tool_specs=None, tool_required=None, tool_dialect='json'):
+        self.tool_dialect = tool_dialect
+        self.any_xml_call = False
         self.mode = "text"
         self.buf = ""
         self.block = ""
         self.tool_specs = tool_specs or {}
+        self.tool_required = (tool_required if tool_required is not None else
+                              {name: set(props) for name, props in self.tool_specs.items()})
         self.last_rejection = ""
         self.t_open = chr(60) + "tool_call" + chr(62)
         # Qwen3 closes with the bracket-slash form, not an XML-style end tag
@@ -332,6 +408,79 @@ class ToolCallStreamParser:
             if tag.startswith(s[-k:]):
                 return k
         return 0
+
+    def _xml_boundary(self, text):
+        """Incrementally walk structural XML tags, never tags in values.
+
+        The dialect is not general XML: a parameter delimiter is structural
+        only when followed by another parameter/function/trailing closer.
+        Keep the scan position so long values are not rescanned per token.
+        """
+        param_re = r'<parameter(?:=[A-Za-z_][\w.-]*|\s+name="[A-Za-z_][\w.-]*")>'
+        followers = ('<parameter=', '<parameter name=', '</function>',
+                     '</invoke>', '</parameter>')
+        while True:
+            p = self.xml_pos
+            state = self.xml_state
+            if state in ('start', 'between', 'after'):
+                while p < len(text) and text[p].isspace():
+                    p += 1
+                self.xml_pos = p
+                if p == len(text):
+                    return -1
+                rest = text[p:]
+                if state == 'start':
+                    end = text.find('>', p)
+                    if end < 0:
+                        return -1
+                    if not re.fullmatch(r'<function=[A-Za-z_][\w.-]*>', text[p:end + 1]):
+                        self.xml_state = 'bad'
+                        continue
+                    self.xml_pos, self.xml_state = end + 1, 'between'
+                elif state == 'after':
+                    if rest.startswith(self.t_close):
+                        return p
+                    if self.t_close.startswith(rest):
+                        return -1
+                    self.xml_state = 'bad'
+                elif rest.startswith('</function>'):
+                    self.xml_pos, self.xml_state = p + len('</function>'), 'after'
+                elif rest.startswith(('</invoke>', '</parameter>')):
+                    end = text.find('>', p)
+                    self.xml_pos = end + 1
+                else:
+                    match = re.match(param_re, text[p:])
+                    if match:
+                        self.xml_pos, self.xml_state = p + match.end(), 'value'
+                    elif any(prefix.startswith(rest) for prefix in followers):
+                        return -1
+                    elif rest.startswith(('<parameter=', '<parameter name=')) and '>' not in rest:
+                        return -1
+                    else:
+                        self.xml_state = 'bad'
+            elif state == 'value':
+                end = text.find('</parameter>', p)
+                if end < 0:
+                    self.xml_pos = max(p, len(text) - len('</parameter>') + 1)
+                    return -1
+                after = end + len('</parameter>')
+                while after < len(text) and text[after].isspace():
+                    after += 1
+                rest = text[after:]
+                if any(rest.startswith(prefix) for prefix in followers):
+                    self.xml_pos, self.xml_state = after, 'between'
+                elif not rest or any(prefix.startswith(rest) for prefix in followers):
+                    self.xml_pos = end
+                    return -1
+                else:
+                    self.xml_pos = end + len('</parameter>')
+            else:
+                # A malformed header/body still has an envelope to quarantine;
+                # do not interpret or repair any of its argument bytes.
+                end = text.find(self.t_close, p)
+                if end < 0:
+                    self.xml_pos = max(p, len(text) - len(self.t_close) + 1)
+                return end
 
     def feed(self, chunk):
         self.buf += chunk
@@ -348,12 +497,26 @@ class ToolCallStreamParser:
                     self.block_json = None
                     self.block_string = False
                     self.block_escape = False
+                    self.xml_pos = 0
+                    self.xml_state = 'start'
                     continue
                 keep = self._prefix_suffix_len(self.buf, self.t_open)
                 if keep < len(self.buf):
                     out.append(("text", self.buf[:len(self.buf) - keep]))
                     self.buf = self.buf[len(self.buf) - keep:]
                 break
+            candidate = self.block + self.buf
+            start = candidate.lstrip()
+            if start.startswith('<function=') or '<function='.startswith(start):
+                self.block, self.buf = candidate, ''
+                end = self._xml_boundary(self.block)
+                if end < 0:
+                    break
+                self.buf = self.block[end + len(self.t_close):]
+                self.block = self.block[:end]
+                self.mode = 'text'
+                out.append(self._parse_block())
+                continue
             # Only a delimiter OUTSIDE a JSON string ends the envelope.
             # Keep lexical state across chunks (including escaped backslashes),
             # otherwise documentation/file contents can split a valid call.
@@ -465,9 +628,14 @@ class ToolCallStreamParser:
             if not isinstance(name, str) or name not in self.tool_specs:
                 return self._reject(block, "unoffered-json-tool")
             args = d.get("arguments", {})
-            if not isinstance(args, str):
-                args = json.dumps(args, ensure_ascii=False)
-            return ("tool", name, args)
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (ValueError, TypeError):
+                    return self._reject(block, 'invalid-json-arguments')
+            if not isinstance(args, dict):
+                return self._reject(block, 'non-object-json-arguments')
+            return ("tool", name, json.dumps(args, ensure_ascii=False))
         except Exception:
             completion = self._recover_completion_result(block)
             if completion is not None:
@@ -480,6 +648,7 @@ class ToolCallStreamParser:
             # this request; never infer a call from arbitrary XML prose.
             alternate = self._parse_function_parameters(block)
             if alternate is not None:
+                self.any_xml_call = True
                 return alternate
             return self._reject(block, "unparseable-block")
 
@@ -494,7 +663,8 @@ class ToolCallStreamParser:
             return None
         args = {}
         pos = 0
-        for param in re.finditer(r'<parameter(?:=([A-Za-z_][\w.-]*)|\s+name="([A-Za-z_][\w.-]*)")>(.*?)</parameter>',
+        for param in re.finditer(r'<parameter(?:=([A-Za-z_][\w.-]*)|\s+name="([A-Za-z_][\w.-]*)")>(.*?)</parameter>'
+                                 r'(?=\s*(?:<parameter(?:=|\s+name=)|</(?:invoke|parameter)>|$))',
                                  inner, re.DOTALL):
             if inner[pos:param.start()].strip():
                 return None
@@ -502,7 +672,12 @@ class ToolCallStreamParser:
             raw = param.group(3)
             if key not in properties:
                 return None
-            value = raw.strip()
+            if raw.startswith('\n'):
+                value = raw[1:]
+                if value.endswith('\n'):
+                    value = value[:-1]
+            else:
+                value = raw[:-1] if self.tool_dialect != 'native_xml' and raw.endswith('\n') else raw
             kind = properties[key].get("type") if isinstance(properties[key], dict) else None
             if isinstance(kind, list):
                 kind = next((k for k in kind if k != "null"), None)
@@ -529,7 +704,8 @@ class ToolCallStreamParser:
         # Zoo can append stray closing tags after a complete parameter
         # (e.g. </invoke></parameter>). Accept only those trailing closers;
         # any unexpected text, opening tag, or conflicting value still fails.
-        if not args or not re.fullmatch(r'\s*(?:</(?:invoke|parameter)>\s*)*', inner[pos:]):
+        if (not set(self.tool_required.get(name, ())).issubset(args) or
+                not re.fullmatch(r'\s*(?:</(?:invoke|parameter)>\s*)*', inner[pos:])):
             return None
         return ("tool", name, json.dumps(args, ensure_ascii=False))
 
@@ -674,11 +850,45 @@ class StrataBackend(pb_grpc.BackendServicer):
                           f"({n / elapsed:.1f} tok/s)", flush=True)
                 return {"tokens": n, "elapsed": elapsed}
 
-    def _stream(self, o, streaming=True, retry_count=0, retry_prompt=None):
-        """Common Predict/PredictStream logic: yields pb.Reply per delta."""
+    def _stream(self, o, streaming=True, retry_count=0, retry_prompt=None,
+                _transaction=False):
+        """Validate tool turns before publishing any executable calls.
+
+        Buffer tool-enabled turns so a failed attempt's prose cannot disable
+        recovery. A committed valid call is never regenerated or replayed.
+        """
+        dialect = getattr(self, 'cfg', {}).get('tool_call_format', 'json')
+        if streaming and not _transaction and _tool_system_block(o.Tools or "", dialect):
+            original = retry_prompt if retry_prompt is not None else o.Prompt
+            reminder = (
+                "I did not produce a valid tool call." + IM_END + "\n" +
+                IM_START + "user\n" +
+                "Retry with exactly one offered tool using the required " +
+                ("native function/parameter" if dialect == 'native_xml' else "JSON") +
+                " tool_call format. Do not repeat invalid arguments or answer " +
+
+                "with an error message or prose." + IM_END + "\n" +
+                IM_START + "assistant\n"
+            )
+            for attempt in range(retry_count, 3):
+                try:
+                    pending = list(self._stream(
+                        o, streaming=True, retry_count=attempt,
+                        retry_prompt=original if attempt == retry_count else original + reminder,
+                        _transaction=True))
+                except ToolFormatError:
+                    if attempt == 2:
+                        raise
+                    print(f"[strata-backend] regenerating rejected turn ({attempt + 1}/2)",
+                          flush=True)
+                    continue
+                yield from pending
+                return
         self._check_identity(o.ModelIdentity)
         prompt = retry_prompt if retry_prompt is not None else o.Prompt
-        tools_text = _tool_system_block(o.Tools or "") if retry_prompt is None else ""
+        if '<bridge_tool_history>' in prompt:
+            prompt = _native_tool_history(prompt, dialect)
+        tools_text = _tool_system_block(o.Tools or "", dialect)
         if tools_text:
             # merge the tools into the FIRST system frame: a second adjacent
             # system frame makes Qwen3 emit im_end as its first token
@@ -688,6 +898,8 @@ class StrataBackend(pb_grpc.BackendServicer):
                 prompt = prompt[:end] + "\n\n" + tools_text + prompt[end:]
             else:
                 prompt = head + "\n" + tools_text + IM_END + "\n" + prompt
+        if dialect == 'native_xml' and prompt.rstrip('\n').endswith(IM_START + 'assistant'):
+            prompt = prompt.rstrip('\n') + '\n<think>\n'
         print(f"[strata-backend] prompt chars={len(prompt)}", flush=True)
         ids = self.tok.encode(prompt, parse_special=True)
         if o.Tokens <= 0:
@@ -700,12 +912,11 @@ class StrataBackend(pb_grpc.BackendServicer):
         stop_prompts = [sp for sp in (o.StopPrompts or []) if sp]
 
         dec = codecs.getincrementaldecoder("utf-8")("replace")
-        buf = bytearray()
         raw = ""             # everything decoded so far, unmodified
         raw_sent = 0         # bytes of `raw` already sent as message deltas
         n = 0                # deltas yielded
         post_think = False   # True after the thinking close token
-        inside_think = False # explicit thinking is never executable tool markup
+        inside_think = prompt.endswith('<think>\n') # native prefix is already inside thinking
         started_text = False # False until the first non-newline char in the current phase
         cd_reason = ""       # reasoning routed via chat deltas
         cd_content = ""      # content routed via chat deltas
@@ -718,6 +929,7 @@ class StrataBackend(pb_grpc.BackendServicer):
         # Zoo function/parameter fallback. Their JSON Schemas also preserve
         # numeric/boolean argument types when the model emits plain text.
         tool_specs = {}
+        tool_required = {}
         try:
             for tool in json.loads(o.Tools or "[]"):
                 fn = tool.get("function", tool)
@@ -726,17 +938,20 @@ class StrataBackend(pb_grpc.BackendServicer):
                 props = (fn.get("parameters") or {}).get("properties", {})
                 if isinstance(fn.get("name"), str) and isinstance(props, dict):
                     tool_specs[fn["name"]] = props
+                    tool_required[fn['name']] = set((fn.get('parameters') or {}).get('required', []))
         except (ValueError, TypeError, AttributeError):
             pass
-        tool_parser = ToolCallStreamParser(tool_specs)
+        tool_parser = ToolCallStreamParser(tool_specs, tool_required, dialect)
         finished = {"tokens": 0, "elapsed": 0.0}
         tok_idx = 0
 
-        def consume(chunk: str, closing=False):
+        ambiguous_tool_suffix = False
+
+        def consume(chunk, closing=False):
             """Route a decoded chunk through the tool parser + think phases.
 
             Returns (reasoning_delta, content_delta, tool_deltas)."""
-            nonlocal post_think, started_text, tc_index, rejected_tool, invalid_seen
+            nonlocal post_think, started_text, tc_index, rejected_tool, invalid_seen, ambiguous_tool_suffix
             events = tool_parser.feed(chunk) if chunk else []
             if closing:
                 events += tool_parser.flush()
@@ -751,17 +966,26 @@ class StrataBackend(pb_grpc.BackendServicer):
                     invalid_seen = True
                     post_think = True
                     started_text = True
-                    # Hermes does not retry a plain-text error on its own.
-                    # Hold it while a bounded internal regeneration is possible.
-                    if not (streaming and retry_count < 2 and tool_specs and
-                            tc_index == 0 and not cd_content):
-                        ct_part += "Tool call rejected: invalid format. Retry with an offered tool."
+                    # Rejected calls are never a normal assistant answer.
+                    # The outer transaction discards failed prose and retries;
+                    # if valid calls exist, publish those once and omit only
+                    # the invalid block so the agent can continue afterwards.
                     continue
                 if ev[0] == "tool":
                     tc_index += 1
                     tools.append(pb.ToolCallDelta(index=tc_index - 1,
                                                   id=str(uuid.uuid4()),
                                                   name=ev[1], arguments=ev[2]))
+                    continue
+                if tc_index and ev[1].strip():
+                    # Native/XML contracts forbid ambiguous value remainders.
+                    # Mark before quarantine; the final transaction validates.
+                    ambiguous_tool_suffix = True
+                    if dialect == 'native_xml':
+                        continue
+                if invalid_seen:
+                    # Text following a malformed envelope may be argument
+                    # remainder, not genuine prose. Quarantine it for this turn.
                     continue
                 s = ev[1]
                 if post_think:
@@ -840,10 +1064,8 @@ class StrataBackend(pb_grpc.BackendServicer):
                         inside_think = False
                         # the thinking close marker routes to the reasoning
                         # stream; the blank run before the answer is suppressed
-                        buf += self.tok.token_bytes(tid)
-                        full = dec.decode(bytes(buf), final=False)
-                        chunk = full[len(raw):]
-                        raw = full
+                        chunk = dec.decode(self.tok.token_bytes(tid), final=False)
+                        raw += chunk
                         rep = send_events(chunk, "", None)
                         if rep:
                             yield rep
@@ -864,12 +1086,12 @@ class StrataBackend(pb_grpc.BackendServicer):
                         self.engine.drain()
                         break
                     tok_idx += 1
-                    buf += self.tok.token_bytes(tid)
-                    full = dec.decode(bytes(buf), final=False)
-                    if len(full) <= len(raw):
-                        continue          # the decoder is still buffering multibyte input
-                    chunk = full[len(raw):]
-                    raw = full
+                    # Incremental decoders receive NEW bytes exactly once.
+                    # Refeeding the cumulative prefix corrupts split UTF-8.
+                    chunk = dec.decode(self.tok.token_bytes(tid), final=False)
+                    if not chunk:
+                        continue
+                    raw += chunk
                     if inside_think:
                         # Tool examples quoted in reasoning are data, not calls.
                         rs_part, ct_part, tools = chunk, "", []
@@ -898,7 +1120,9 @@ class StrataBackend(pb_grpc.BackendServicer):
                             yield rep
                             self.engine.stop()
                             self.engine.drain()
-                            return
+                            # Finalize the parser and validate this attempt just
+                            # as on engine EOF; a stop prompt is not acceptance.
+                            break
                         if (streaming and not post_think and not tools and not ct_part and
                                 not cd_reason.replace("<think>", "").replace("</think>", "").strip()):
                             continue
@@ -910,33 +1134,30 @@ class StrataBackend(pb_grpc.BackendServicer):
                 self.engine.drain()
                 raise
         # trailing bytes that the incremental decoder still holds
-        tail = dec.decode(bytes(buf), final=True)
+        tail = dec.decode(b"", final=True)
+        raw += tail
         if inside_think:
-            rs_part, ct_part, tools = tail[len(raw):], "", []
-        elif len(tail) > len(raw):
-            rs_part, ct_part, tools = consume(tail[len(raw):], closing=True)
+            rs_part, ct_part, tools = tail, "", []
         else:
-            rs_part, ct_part, tools = consume("", closing=True)
+            rs_part, ct_part, tools = consume(tail, closing=True)
         cd_reason += rs_part
         cd_content += ct_part
         if cd_reason[rs_sent:] or cd_content[ct_sent:] or tools:
             yield make_reply(cd_reason[rs_sent:], cd_content[ct_sent:], tools)
-        if streaming and invalid_seen and tc_index == 0 and not cd_content and tool_specs and retry_count < 2:
-            # Re-generate instead of executing or repairing a partial/unknown
-            # tool call. Do not replay the rejected argument values in the
-            # prompt or journal. The first assistant frame is already open.
-            retry_text = (
-                "I did not produce a valid tool call." + IM_END + "\n" +
-                IM_START + "user\n" +
-                "The last tool call was rejected. Retry with exactly one offered "
-                "tool using the required JSON tool_call format. Do not repeat "
-                "the invalid call or answer with prose." + IM_END + "\n" +
-                IM_START + "assistant\n"
-            )
-            print(f"[strata-backend] retrying rejected tool-only turn ({retry_count + 1}/2)",
-                  flush=True)
-            yield from self._stream(o, streaming=streaming, retry_count=retry_count + 1,
-                                    retry_prompt=prompt + retry_text)
+        if ambiguous_tool_suffix and (dialect == 'native_xml' or tool_parser.any_xml_call):
+            print('[strata-backend] failed tool turn: ambiguous native suffix; no calls published', flush=True)
+            raise ToolFormatError('Ambiguous native tool turn; no calls published')
+        rejection_echo = cd_content.strip() == (
+            "Tool call rejected: invalid format. Retry with an offered tool.")
+        if streaming and tc_index == 0 and tool_specs and (
+                invalid_seen or rejection_echo or not cd_content.strip()):
+            print('[strata-backend] failed tool turn: '
+                  f'invalid={invalid_seen} echo={rejection_echo} '
+                  f'reason_chars={len(cd_reason)} content_chars={len(cd_content)} '
+                  f'generated_tokens={tok_idx} inside_think={inside_think} '
+                  f'post_think={post_think} '
+                  f'tool_marker_in_reason={"<tool_call>" in cd_reason}', flush=True)
+            raise ToolFormatError("Invalid, empty or incomplete tool turn; no calls published")
 
     # -- gRPC surface ------------------------------------------------------
 

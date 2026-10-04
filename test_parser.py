@@ -60,6 +60,69 @@ class PredictReplyTests(unittest.TestCase):
 
 
 class ToolCallStreamParserTests(unittest.TestCase):
+    def test_native_xml_preserves_string_tags_and_whitespace(self):
+        values = ['  leading and trailing  \n',
+                  'literal </tool_call> stays inside the argument',
+                  'literal </parameter> inside a paragraph',
+                  'literal </function> and </tool_call> inside a paragraph']
+        for value in values:
+            raw = ('<tool_call>\n<function=write_file>\n<parameter=content>\n' + value +
+                   '\n</parameter>\n</function>\n</tool_call>')
+            for size in (1, 7, len(raw)):
+                with self.subTest(value=value, size=size):
+                    result = events(raw, size=size, specs={'write_file': {'content': {'type': 'string'}}})
+                    self.assertEqual([e[0] for e in result], ['tool'])
+                    self.assertEqual(json.loads(result[0][2]), {'content': value})
+
+    def test_xml_collisions_at_every_single_chunk_boundary(self):
+        value = '  literal </tool_call>, </parameter> and </function> with ä\n'
+        raw = ('<tool_call><function=write_file><parameter=content>\n' + value +
+               '\n</parameter></function></tool_call>')
+        for split in range(len(raw) + 1):
+            parser = Parser({'write_file': {'content': {'type': 'string'}}})
+            result = parser.feed(raw[:split]) + parser.feed(raw[split:]) + parser.flush()
+            self.assertEqual([e[0] for e in result], ['tool'])
+            self.assertEqual(json.loads(result[0][2]), {'content': value})
+
+    def test_xml_truncated_collision_never_publishes_argument_remainders(self):
+        raw = ('<tool_call><function=write_file><parameter=content>\n'
+               'PRIVATE </tool_call> and </parameter> in a value')
+        for size in (1, 7, len(raw)):
+            result = events(raw, size=size, specs={'write_file': {'content': {'type': 'string'}}})
+            self.assertEqual(result, [('invalid_tool',)])
+
+    def test_invalid_json_argument_containers_are_not_calls(self):
+        for args in (None, [], 'not-json', '{"command":', '[]', 'null'):
+            raw = '<tool_call>' + json.dumps({'name': 'terminal', 'arguments': args}) + '</tool_call>'
+            for size in (1, 7, len(raw)):
+                result = events(raw, size=size, specs={'terminal': {'command': {'type': 'string'}}})
+                self.assertEqual(result, [('invalid_tool',)])
+
+    def test_inline_xml_string_keeps_terminal_newline(self):
+        value = '  ä😀\n'
+        text = '<tool_call><function=write_file><parameter=content>' + value + '</parameter></function></tool_call>'
+        for size in (1, 7, len(text)):
+            parser = Parser({'write_file': {'content': {'type': 'string'}}}, tool_dialect='native_xml')
+            events = []
+            for start in range(0, len(text), size):
+                events.extend(parser.feed(text[start:start + size]))
+            events.extend(parser.flush())
+            self.assertEqual(json.loads([e[2] for e in events if e[0] == 'tool'][0]), {'content': value})
+
+    def test_optional_only_xml_function_allows_empty_arguments(self):
+        parser = Parser({'status': {'verbose': {'type': 'boolean'}}}, {'status': set()})
+        self.assertEqual(parser.feed('<tool_call><function=status></function></tool_call>') + parser.flush(),
+                         [('tool', 'status', '{}')])
+        parser = Parser({'status': {'verbose': {'type': 'boolean'}}}, {'status': {'verbose'}})
+        self.assertEqual(parser.feed('<tool_call><function=status></function></tool_call>') + parser.flush(),
+                         [('invalid_tool',)])
+
+    def test_parameterless_offered_xml_call_is_valid(self):
+        raw = '<tool_call><function=status></function></tool_call>'
+        for size in (1, 7, len(raw)):
+            self.assertEqual(events(raw, size=size, specs={'status': {}}),
+                             [('tool', 'status', '{}')])
+
     def test_json_string_delimiters_roundtrip_without_rejection_or_leak(self):
         values = ['```json\n{"ok": true}\n```',
                   'Literal </tool_call> inside a string',
@@ -119,7 +182,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                              ChatDelta=lambda **kw: SimpleNamespace(**kw),
                              ToolCallDelta=lambda **kw: SimpleNamespace(**kw))
         ns = dict(json=json, re=re, codecs=codecs, time=time, uuid=uuid,
-                  pb=pb, ToolCallStreamParser=Parser,
+                  pb=pb, ToolCallStreamParser=Parser, ToolFormatError=RuntimeError,
                   IM_START='<|' + 'im_start' + '|>', IM_END='<|' + 'im_end' + '|>')
         exec(compile(ast.Module(body=[tool_block, budget_fn, stream], type_ignores=[]),
                      str(SOURCE), 'exec'), ns)
@@ -127,13 +190,13 @@ class ToolCallStreamParserTests(unittest.TestCase):
         class Probe:
             gen_lock = contextlib.nullcontext()
             stop_ids = set()
-            think_close_ids = set()
+            think_close_ids = {1}
             engine = SimpleNamespace(max_context=1024)
             def __init__(self, responses):
                 self.responses = responses
                 self.prompts = []
                 self.tok = SimpleNamespace(encode=self.encode,
-                                           token_bytes=lambda tid: self.response.encode())
+                                           token_bytes=lambda tid: b'</think>' if tid == 1 else self.response.encode())
             def encode(self, prompt, parse_special):
                 self.prompts.append(prompt)
                 return [1]
@@ -145,6 +208,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                 return ''
             def _generate(self, ids, max_new, keys):
                 self.response = self.responses.pop(0)
+                yield 1
                 yield 2
 
         Probe._stream = ns['_stream']
@@ -155,7 +219,9 @@ class ToolCallStreamParserTests(unittest.TestCase):
                                Tools=json.dumps([offered]), Tokens=100, StopPrompts=[])
         valid = '<tool_call>{"name":"terminal","arguments":{"command":"pwd"}}</tool_call>'
         invalid = '<tool_call>{"name":"invented","arguments":{"command":"DO-NOT-RUN"}}</tool_call>'
-        for bad in (invalid, '<tool_call>{"name":"terminal","arguments":{"command":"DO-NOT-RUN"}'):
+        for bad in (invalid, '<tool_call>{"name":"terminal","arguments":{"command":"DO-NOT-RUN"}',
+                    'I will check now.\n' + invalid,
+                    'Tool call rejected: invalid format. Retry with an offered tool.'):
             with self.subTest(bad=bad[:35]):
                 probe = Probe([bad, valid])
                 replies = list(ns['_stream'](probe, opts))
@@ -171,13 +237,9 @@ class ToolCallStreamParserTests(unittest.TestCase):
                 self.assertIn('Retry', probe.prompts[1])
 
         probe = Probe([invalid, invalid, invalid])
-        replies = list(ns['_stream'](probe, opts))
+        with self.assertRaisesRegex(RuntimeError, 'tool turn'):
+            list(ns['_stream'](probe, opts))
         self.assertEqual(len(probe.prompts), 3, 'never retry without a bound')
-        self.assertFalse([t for r in replies for d in r.chat_deltas
-                          for t in getattr(d, 'tool_calls', [])])
-        self.assertEqual(''.join(getattr(d, 'content', '') for r in replies
-                                 for d in r.chat_deltas),
-                         'Tool call rejected: invalid format. Retry with an offered tool.')
 
         probe = Probe([valid + invalid])
         replies = list(ns['_stream'](probe, opts))
@@ -196,7 +258,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                              ChatDelta=lambda **kw: SimpleNamespace(**kw),
                              ToolCallDelta=lambda **kw: SimpleNamespace(**kw))
         ns = dict(json=json, re=re, codecs=codecs, time=time, uuid=uuid, pb=pb,
-                  ToolCallStreamParser=Parser,
+                  ToolCallStreamParser=Parser, ToolFormatError=RuntimeError,
                   IM_START='<|' + 'im_start' + '|>', IM_END='<|' + 'im_end' + '|>')
         exec(compile(ast.Module(body=helpers + [stream], type_ignores=[]), str(SOURCE), 'exec'), ns)
         thought = 'Example: <tool_call>{"name":"terminal","arguments":{"command":"NEVER-RUN"}}</tool_call> and <tool_call>example</tool_call>'
@@ -222,6 +284,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                   'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}}}}]
         opts = SimpleNamespace(ModelIdentity='', Prompt='Test', Tools=json.dumps(tools),
                                Tokens=300, StopPrompts=[])
+        Probe._stream = ns['_stream']
         replies = list(ns['_stream'](Probe(), opts))
         calls = [t for r in replies for d in r.chat_deltas for t in getattr(d, 'tool_calls', [])]
         content = ''.join(getattr(d, 'content', '') for r in replies for d in r.chat_deltas)
@@ -382,7 +445,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
             ChatDelta=lambda **kw: SimpleNamespace(**kw),
             ToolCallDelta=lambda **kw: SimpleNamespace(**kw))
         ns = dict(json=json, re=re, codecs=codecs, time=time, uuid=uuid,
-                  pb=pb, ToolCallStreamParser=Parser,
+                  pb=pb, ToolCallStreamParser=Parser, ToolFormatError=RuntimeError,
                   IM_START='<|' + 'im_start' + '|>', IM_END='<|' + 'im_end' + '|>')
         tool_block = next(n for n in module.body if isinstance(n, ast.FunctionDef)
                           and n.name == '_tool_system_block')
@@ -426,6 +489,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                            'timeout': {'type': 'integer'}}}}}]
         opts = SimpleNamespace(ModelIdentity='', Prompt='', Tools=json.dumps(tools),
                                Tokens=300, StopPrompts=[])
+        Probe._stream = ns['_stream']
         replies = list(ns['_stream'](Probe(), opts))
         clean = ''.join(getattr(d, 'content', '') for r in replies for d in r.chat_deltas)
         calls = [t for r in replies for d in r.chat_deltas for t in getattr(d, 'tool_calls', [])]
@@ -445,6 +509,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                '<parameter=command>npm run build --workspace frontend</parameter>'
                '</invoke></parameter></function></tool_call>')
         chunks = [raw[i:i + 3] for i in range(0, len(raw), 3)]
+        Probe._stream = ns['_stream']
         replies = list(ns['_stream'](Probe(), opts))
         calls = [t for r in replies for d in r.chat_deltas for t in getattr(d, 'tool_calls', [])]
         self.assertEqual(len(calls), 1)
@@ -459,14 +524,9 @@ class ToolCallStreamParserTests(unittest.TestCase):
         raw = ('<tool_call><function=delete_everything>'
                '<parameter=command>pwd</parameter></function></tool_call>')
         chunks = [raw[i:i + 3] for i in range(0, len(raw), 3)]
-        replies = list(ns['_stream'](Probe(), opts))
-        self.assertFalse([t for r in replies for d in r.chat_deltas
-                          for t in getattr(d, 'tool_calls', [])])
-        self.assertNotIn(b'<tool_call>', b''.join(r.message for r in replies))
-        safe_content = ''.join(getattr(d, 'content', '')
-                               for r in replies for d in r.chat_deltas)
-        self.assertIn('Tool call rejected', safe_content)
-        self.assertNotIn('<tool_call>', safe_content)
+        Probe._stream = ns['_stream']
+        with self.assertRaisesRegex(RuntimeError, 'tool turn'):
+            list(ns['_stream'](Probe(), opts))
 
         # A malformed final report is emitted as a structured completion in
         # streaming mode, even when Zoo offers an optional command parameter.
@@ -478,6 +538,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
         raw = ('<tool_call>{"name":"attempt_completion",'
                '"arguments":{"result":"' + report + '"}}</tool_call>')
         chunks = [raw[i:i + 3] for i in range(0, len(raw), 3)]
+        Probe._stream = ns['_stream']
         replies = list(ns['_stream'](Probe(), opts))
         calls = [t for r in replies for d in r.chat_deltas
                  for t in getattr(d, 'tool_calls', [])]
@@ -496,6 +557,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
         raw = ('<tool_call>{"name":"execute_command",'
                '"arguments":{"command":"npm run build --workspace frontend"}}</tool_call>')
         chunks = [raw[i:i + 3] for i in range(0, len(raw), 3)]
+        Probe._stream = ns['_stream']
         replies = list(ns['_stream'](Probe(), opts))
         self.assertEqual(b''.join(r.message for r in replies), b'')
         self.assertEqual([d.reasoning_content for r in replies for d in r.chat_deltas
@@ -526,7 +588,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                              ChatDelta=lambda **kw: SimpleNamespace(**kw),
                              ToolCallDelta=lambda **kw: SimpleNamespace(**kw))
         ns = dict(json=json, re=re, codecs=codecs, time=time, uuid=uuid,
-                  pb=pb, ToolCallStreamParser=Parser,
+                  pb=pb, ToolCallStreamParser=Parser, ToolFormatError=RuntimeError,
                   IM_START='<|' + 'im_start' + '|>', IM_END='<|' + 'im_end' + '|>')
         budget_fn = next(n for n in module.body if isinstance(n, ast.FunctionDef)
                          and n.name == '_generation_limit')
@@ -549,6 +611,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                   'parameters': {'type': 'object', 'properties': {'todos': {'type': 'string'}}}}}]
         opts = SimpleNamespace(ModelIdentity='', Prompt='', Tools=json.dumps(tools),
                                Tokens=100, StopPrompts=[])
+        Probe._stream = ns['_stream']
         replies = list(ns['_stream'](Probe(), opts))
         reasoning = ''.join(getattr(d, 'reasoning_content', '') for r in replies for d in r.chat_deltas)
         self.assertEqual(reasoning, '')
@@ -560,6 +623,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
         tokens = [b'<think>', b'Plan the next step', b'\n', b'</think>',
                   b'<tool_call>{"name":"update_todo_list",',
                   b'"arguments":{"todos":"[ ] Check"}}</tool_call>']
+        Probe._stream = ns['_stream']
         replies = list(ns['_stream'](Probe(), opts))
         reasoning = ''.join(getattr(d, 'reasoning_content', '') for r in replies for d in r.chat_deltas)
         self.assertIn('Plan the next step', reasoning)
