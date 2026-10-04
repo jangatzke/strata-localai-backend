@@ -542,7 +542,7 @@ def _native_tool_history(prompt, dialect='native_xml'):
                     end += 1
                 name, args = call['name'], call['arguments']
                 if (not text.startswith(closing, end) or not isinstance(args, dict) or
-                        not isinstance(name, str) or not re.fullmatch(r'[A-Za-z_][\w.-]*', name) or
+                        not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_][\w.-]*', name) or
                         any(not isinstance(k, str) or not re.fullmatch(r'[A-Za-z_][\w.-]*', k) for k in args)):
                     raise ValueError
             except (ValueError, TypeError, KeyError):
@@ -618,7 +618,7 @@ class ToolCallStreamParser:
                     end = text.find('>', p)
                     if end < 0:
                         return -1
-                    if not re.fullmatch(r'<function=[A-Za-z_][\w.-]*>', text[p:end + 1]):
+                    if not re.fullmatch(r'<function=[A-Za-z0-9_][\w.-]*>', text[p:end + 1]):
                         self.xml_state = 'bad'
                         continue
                     self.xml_pos, self.xml_state = end + 1, 'between'
@@ -741,11 +741,11 @@ class ToolCallStreamParser:
 
     def _reject(self, block, reason):
         """Record only structural metadata; tool arguments may contain secrets."""
-        fn = re.search(r'<function=([A-Za-z_][\w.-]*)>', block)
+        fn = re.search(r'<function=([A-Za-z0-9_][\w.-]*)>', block)
         dialect = "xml" if fn else ("json" if block.lstrip().startswith("{") else "other")
         name = fn.group(1) if fn else None
         if not name and dialect == "json":
-            match = re.search(r'"name"\s*:\s*"([A-Za-z_][\w.-]*)"', block)
+            match = re.search(r'"name"\s*:\s*"([A-Za-z0-9_][\w.-]*)"', block)
             name = match.group(1) if match else None
         offered = name if name in self.tool_specs else "unoffered-or-unknown"
         params = len(re.findall(r'<parameter(?:=|\s+name=)', block))
@@ -838,7 +838,7 @@ class ToolCallStreamParser:
             return self._reject(block, "unparseable-block")
 
     def _parse_function_parameters(self, block):
-        fn = re.fullmatch(r"\s*<function=([A-Za-z_][\w.-]*)>(.*?)</function>\s*",
+        fn = re.fullmatch(r"\s*<function=([A-Za-z0-9_][\w.-]*)>(.*?)</function>\s*",
                           block, re.DOTALL)
         if not fn or fn.group(1) not in self.tool_specs:
             return None

@@ -109,6 +109,35 @@ class ToolCallStreamParserTests(unittest.TestCase):
             events.extend(parser.flush())
             self.assertEqual(json.loads([e[2] for e in events if e[0] == 'tool'][0]), {'content': value})
 
+    def test_numeric_prefix_tool_names_remain_exact_and_allowlisted(self):
+        for name in ('1_searxng_web_search', '1_web_url_read'):
+            specs = {name: {'query': {'type': 'string'}}}
+            raw = (f'<tool_call><function={name}><parameter=query>test</parameter>'
+                   '</function></tool_call>')
+            for size in (1, 7, len(raw)):
+                self.assertEqual(events(raw, size=size, specs=specs),
+                                 [('tool', name, '{"query": "test"}')])
+                self.assertEqual(events(raw, size=size, specs={'other': specs[name]}),
+                                 [('invalid_tool',)])
+
+    def test_numeric_prefix_marked_history_roundtrip(self):
+        node = next(n for n in module.body if isinstance(n, ast.FunctionDef)
+                    and n.name == '_native_tool_history')
+        start, end = '<|' + 'im_start|>', '<|' + 'im_end|>'
+        scope = {'json': json, 're': re, 'ToolFormatError': ValueError,
+                 'IM_START': start, 'IM_END': end}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), 'exec'), scope)
+        call = {'name': '1_web_url_read', 'arguments': {'url': 'https://docs.python.org/'}}
+        prompt = start + 'assistant\n<bridge_tool_history>' + json.dumps(call) + '</bridge_tool_history>' + end
+        result = scope['_native_tool_history'](prompt)
+        self.assertIn('<function=1_web_url_read>', result)
+        self.assertNotIn('<bridge_tool_history>', result)
+        for dialect in ('native_xml', 'json'):
+            rendered = scope['_native_tool_history'](prompt, dialect)
+            body = rendered[len(start + 'assistant\n'):-len(end)]
+            self.assertEqual(events(body, specs={'1_web_url_read': {'url': {'type': 'string'}}}),
+                             [('tool', '1_web_url_read', '{"url": "https://docs.python.org/"}')])
+
     def test_optional_only_xml_function_allows_empty_arguments(self):
         parser = Parser({'status': {'verbose': {'type': 'boolean'}}}, {'status': set()})
         self.assertEqual(parser.feed('<tool_call><function=status></function></tool_call>') + parser.flush(),
