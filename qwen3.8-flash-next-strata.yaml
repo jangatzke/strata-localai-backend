@@ -33,6 +33,7 @@ function:
 template:
   use_tokenizer_template: false
   join_chat_messages_by_character: ""
+  multimodal: '{{ range .Images }}<|vision_start|><|image_pad|><|vision_end|>{{ end }}{{ .Text }}'
   chat_message: |
     {{ if eq .RoleName "tool" }}<|im_start|>user
     <tool_response>

@@ -16,16 +16,22 @@ pack's vocab.json / merges.txt / token_type.json.
 """
 
 import argparse
+import base64
 import codecs
+import hashlib
+import io
 import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.request
 import uuid
 from concurrent import futures
 from pathlib import Path
@@ -39,6 +45,8 @@ import backend_pb2_grpc as pb_grpc
 # never appear verbatim in logs of this file's source).
 IM_END = "<|" + "im_end" + "|>"
 IM_START = "<|" + "im_start" + "|>"
+VISION_START = "<|" + "vision_start" + "|>"
+IMAGE_PAD = "<|" + "image_pad" + "|>"
 
 READY_TIMEOUT_S = 1200   # engine load takes minutes (experts + PLE)
 GEN_TIMEOUT_S = 3600     # per-request hard ceiling
@@ -738,11 +746,137 @@ def _generation_limit(requested, prompt_tokens, max_context):
     return room
 
 
+class Vision:
+    """Resident CPU image encoder using Strata's strata-vision protocol."""
+
+    def __init__(self, cfg: dict, env: dict | None = None):
+        args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
+        if cfg.get("gpu"):
+            args.append("--gpu")
+        if cfg.get("threads"):
+            args += ["--threads", str(cfg["threads"])]
+        if cfg.get("max_tokens"):
+            args += ["--max-tokens", str(cfg["max_tokens"])]
+        self.args = args
+        self.env = env
+        self.max_bytes = int(cfg.get("max_image_bytes", 50 * 1024 * 1024))
+        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
+        self.proc = None
+        self.lock = threading.Lock()
+        self.cache: dict[str, tuple[Path, int]] = {}
+
+    def start(self):
+        if self.proc is not None and self.proc.poll() is None:
+            return
+        self.proc = subprocess.Popen(
+            self.args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
+            env=self.env)
+        line = self.proc.stdout.readline()
+        if not line.startswith("READY"):
+            self.close()
+            raise RuntimeError("the vision encoder did not start: " + line.strip())
+        print("[strata-backend] CPU vision encoder READY", flush=True)
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def _load(self, source: str) -> bytes:
+        if source.startswith("data:"):
+            data = base64.b64decode(source.split(",", 1)[1], validate=True)
+        elif source.startswith(("http://", "https://")):
+            req = urllib.request.Request(source, headers={"User-Agent": "strata"})
+            with urllib.request.urlopen(req, timeout=60) as response:
+                data = response.read(self.max_bytes + 1)
+        else:
+            path = source[7:] if source.startswith("file://") else source
+            if path and os.path.isfile(path):
+                with open(path, "rb") as image_file:
+                    data = image_file.read(self.max_bytes + 1)
+            else:
+                # LocalAI passes image_url content to external backends as raw base64.
+                data = base64.b64decode(source, validate=True)
+        if len(data) > self.max_bytes:
+            raise ValueError(f"image exceeds the {self.max_bytes}-byte limit")
+        return data
+
+    @staticmethod
+    def _normalize(data: bytes) -> bytes:
+        if (data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or
+                data[:2] == b"BM" or data[:6] in (b"GIF87a", b"GIF89a")):
+            return data
+        try:
+            from PIL import Image
+        except ImportError:
+            raise ValueError("this image format needs Pillow; JPEG, PNG, BMP and GIF work without it") from None
+        try:
+            image = Image.open(io.BytesIO(data))
+            image.load()
+        except Exception as exc:
+            raise ValueError(f"the image could not be read ({exc})") from None
+        if image.mode in ("RGBA", "LA") or image.mode == "P" and "transparency" in image.info:
+            image = image.convert("RGBA")
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            background.paste(image, mask=image.split()[-1])
+            image = background
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+        out = io.BytesIO()
+        image.save(out, format="PNG")
+        return out.getvalue()
+
+    def encode(self, source: str) -> tuple[Path, int]:
+        data = self._normalize(self._load(source))
+        key = hashlib.sha256(data).hexdigest()[:32]
+        with self.lock:
+            self.start()
+            if key in self.cache:
+                return self.cache[key]
+            image, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
+            image.write_bytes(data)
+            try:
+                self.proc.stdin.write(f"ENC {image} {out}\n")
+                self.proc.stdin.flush()
+                line = self.proc.stdout.readline().strip()
+            finally:
+                image.unlink(missing_ok=True)
+            if not line.startswith("OK"):
+                raise ValueError("the image could not be read: " +
+                                 (line[4:] if line.startswith("ERR") else "the vision encoder stopped"))
+            self.cache[key] = (out, int(line.split()[1]))
+            if len(self.cache) > 64:
+                old = next(iter(self.cache))
+                self.cache.pop(old)[0].unlink(missing_ok=True)
+            return self.cache[key]
+
+    def combine(self, sources) -> tuple[Path, list[int]]:
+        encoded = [self.encode(source) for source in sources]
+        combined = self.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
+        with open(combined, "wb") as output:
+            for path, _ in encoded:
+                output.write(path.read_bytes())
+        return combined, [count for _, count in encoded]
+
+    def close(self):
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.stdin.write("QUIT\n")
+                    proc.stdin.flush()
+                    proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
 class StrataBackend(pb_grpc.BackendServicer):
     def __init__(self, cfg: dict, tok):
         self.cfg = cfg
         self.tok = tok
         self.engine = Engine(cfg)
+        self.vision = None
+        self.vision_cfg = cfg.get("vision")
         self.gen_lock = threading.Semaphore(1)   # one generation at a time
         self.load_lock = threading.Lock()
         # stop markers: ChatML frame tokens plus the engine's end-of-text token
@@ -774,15 +908,59 @@ class StrataBackend(pb_grpc.BackendServicer):
 
     def load(self) -> str:
         with self.load_lock:
-            if self.engine.alive():
+            if self.engine.alive() and (not self.vision_cfg or self.vision and self.vision.alive()):
                 return "already loaded"
             print(f"[strata-backend] LoadModel: starting the engine for {self.cfg['model_name']}", flush=True)
             t0 = time.time()
-            self.engine.start()
+            try:
+                if self.vision_cfg and (self.vision is None or not self.vision.alive()):
+                    if self.vision is not None:
+                        self.vision.close()
+                    self.vision = Vision(self.vision_cfg, self.engine._env())
+                    self.vision.start()
+                self.engine.start()
+            except Exception:
+                if self.vision is not None:
+                    self.vision.close()
+                    self.vision = None
+                raise
             print(f"[strata-backend] engine READY after {time.time() - t0:.1f}s "
-                  f"(context {self.engine.max_context}, stop={'yes' if self.engine.can_stop else 'no'})",
-                  flush=True)
+                  f"(context {self.engine.max_context}, stop={'yes' if self.engine.can_stop else 'no'}, "
+                  f"vision={'cpu' if self.vision else 'off'})", flush=True)
             return "loaded"
+
+    def free(self):
+        self.engine.free()
+        if self.vision is not None:
+            self.vision.close()
+            self.vision = None
+
+    def _prepare_images(self, sources, ids):
+        if not sources:
+            return ids, None
+        if not self.vision_cfg:
+            raise ValueError("this backend was started without a vision encoder")
+        self._ensure_loaded()
+        combined, counts = self.vision.combine(sources)
+        pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+        start = self.tok.encode(VISION_START, parse_special=True)[0]
+        literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+        expanded, image_index = [], 0
+        for token_index, token in enumerate(ids):
+            if (token == pad and token_index > 0 and ids[token_index - 1] == start and
+                    image_index < len(counts)):
+                expanded += [pad] * counts[image_index]
+                image_index += 1
+            elif token == pad:
+                expanded += literal
+            else:
+                expanded.append(token)
+        if image_index != len(counts):
+            combined.unlink(missing_ok=True)
+            raise ValueError("the prompt and its images do not match; configure the LocalAI multimodal template")
+        print(f"[strata-backend] vision: {len(counts)} image(s), "
+              f"{sum(counts)} image tokens on CPU", flush=True)
+        return expanded, combined
 
     def _sampling_keys(self, o) -> str:
         keys = ""
@@ -810,13 +988,15 @@ class StrataBackend(pb_grpc.BackendServicer):
             keys += f" seed={int(o.Seed)}"
         return keys
 
-    def _generate(self, ids, max_new, keys):
-        """Run one GEN request; yields token ids; returns metadata at the end."""
+    def _generate(self, ids, max_new, keys, embeddings=None):
+        """Run one GEN/GENI request; yields token ids; returns metadata at the end."""
         self._ensure_loaded()
-        gen_line = f"GEN {max_new}{keys} {' '.join(map(str, ids))}"
+        command = "GENI" if embeddings else "GEN"
+        image_arg = f" {embeddings}" if embeddings else ""
+        gen_line = f"{command} {max_new}{keys}{image_arg} {','.join(map(str, ids))}"
         self.engine._send(gen_line)
-        print(f"[strata-backend] GEN: {len(ids)} prompt tokens, max_new={max_new}{keys or ' (engine defaults)'}",
-              flush=True)
+        print(f"[strata-backend] {command}: {len(ids)} prompt tokens, "
+              f"max_new={max_new}{keys or ' (engine defaults)'}", flush=True)
         started = time.time()
         n = 0
         while True:
@@ -902,6 +1082,10 @@ class StrataBackend(pb_grpc.BackendServicer):
             prompt = prompt.rstrip('\n') + '\n<think>\n'
         print(f"[strata-backend] prompt chars={len(prompt)}", flush=True)
         ids = self.tok.encode(prompt, parse_special=True)
+        embeddings = None
+        images = list(getattr(o, "Images", ()) or ())
+        if images:
+            ids, embeddings = StrataBackend._prepare_images(self, images, ids)
         if o.Tokens <= 0:
             self._ensure_loaded()  # READY supplies the actual engine context
         max_context = self.engine.max_context if o.Tokens <= 0 else 0
@@ -1050,7 +1234,8 @@ class StrataBackend(pb_grpc.BackendServicer):
             return None
 
         with self.gen_lock:
-            gen = self._generate(ids, max_new, keys)
+            gen = (self._generate(ids, max_new, keys, embeddings) if embeddings is not None
+                   else self._generate(ids, max_new, keys))
             try:
                 while True:
                     try:
@@ -1131,6 +1316,9 @@ class StrataBackend(pb_grpc.BackendServicer):
                 self.engine.stop()
                 self.engine.drain()
                 raise
+            finally:
+                if embeddings is not None:
+                    embeddings.unlink(missing_ok=True)
         # trailing bytes that the incremental decoder still holds
         tail = dec.decode(b"", final=True)
         raw += tail
@@ -1179,8 +1367,8 @@ class StrataBackend(pb_grpc.BackendServicer):
             return pb.Result(success=False, message=str(e))
 
     def Free(self, request, context):
-        print("[strata-backend] Free: unloading the engine (releasing GPU/RAM)", flush=True)
-        self.engine.free()
+        print("[strata-backend] Free: unloading the engine and CPU vision encoder", flush=True)
+        self.free()
         return pb.Result(success=True, message="freed")
 
     def Predict(self, request, context):
@@ -1252,7 +1440,7 @@ def main():
     backend = StrataBackend(cfg, tok)
 
     def shutdown(*_):
-        backend.engine.free()
+        backend.free()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
