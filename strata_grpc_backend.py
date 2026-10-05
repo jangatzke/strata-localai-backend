@@ -125,6 +125,7 @@ class Engine:
         self.log = None
         self.send_lock = threading.Lock()
         self.admission_lock = threading.Lock()
+        self.admission_broken = False
         self.slot_lines = {slot: queue.Queue() for slot in range(self.parallel)}
         self.free_slots = queue.Queue()
         for slot in range(self.parallel):
@@ -179,6 +180,7 @@ class Engine:
             stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8",
             bufsize=1, env=self._env())
         self.lines = queue.Queue()
+        self.admission_broken = False
         self.slot_lines = {slot: queue.Queue() for slot in range(self.parallel)}
         self.free_slots = queue.Queue()
         for slot in range(self.parallel):
@@ -306,12 +308,22 @@ class Engine:
         if self.parallel == 2 and self.alive() and not drained_terminal:
             raise EngineError(f"batch slot {slot} did not drain safely without BDONE")
 
-    def batch_generate(self, max_new, keys, ids, embeddings=None):
+    def batch_generate(self, max_new, keys, ids, embeddings=None, check_active=None):
         """Admit and serve one request on an isolated Strata batch slot."""
         if self.parallel != 2:
             raise EngineError("batch generation requires parallel=2")
-        slot = self.free_slots.get()
+        while True:
+            if self.admission_broken:
+                raise EngineError("batch admission is unreconciled; reload the engine")
+            if check_active is not None:
+                check_active()
+            try:
+                slot = self.free_slots.get(timeout=0.1)
+                break
+            except queue.Empty:
+                continue
         admitted = completed = False
+        pending = stop_sent = False
         started = time.time()
         try:
             command = "BGENI" if embeddings is not None else "BGEN"
@@ -321,43 +333,72 @@ class Engine:
             # BGEN admission is serialized by Strata. Its untagged T/DONE
             # compatibility output must be consumed here, never by active slots.
             with self.admission_lock:
+                if self.admission_broken:
+                    raise EngineError("batch admission is unreconciled; reload the engine")
+                if check_active is not None:
+                    check_active()
                 self._send(line)
+                pending = True
                 deadline = time.time() + GEN_TIMEOUT_S
                 admission_tokens = []
                 admission_done = False
                 serial_fallback = None
-                while True:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        raise EngineError(f"batch admission timed out for slot {slot}")
-                    try:
-                        response = self.lines.get(timeout=min(1.0, remaining))
-                    except queue.Empty:
-                        if not self.alive():
+                failure = None
+                try:
+                    while True:
+                        if failure is None:
+                            try:
+                                if check_active is not None:
+                                    check_active()
+                                if time.time() >= deadline:
+                                    raise EngineError(f"batch admission timed out for slot {slot}")
+                            except Exception as exc:
+                                # BGEN is already on stdin. Retain the untagged
+                                # owner until BADM resolves it. BSTOP targets
+                                # only this slot, never an active peer.
+                                failure = exc
+                                self.stop(slot)
+                                stop_sent = True
+                                deadline = time.time() + 120.0
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            raise EngineError(f"batch admission unreconciled for slot {slot}") from failure
+                        try:
+                            response = self.lines.get(timeout=min(0.1, remaining))
+                        except queue.Empty:
+                            if not self.alive():
+                                raise EngineError("the engine died during batch admission")
+                            continue
+                        if response is None:
                             raise EngineError("the engine died during batch admission")
-                        continue
-                    if response is None:
-                        raise EngineError("the engine died during batch admission")
-                    if response.startswith("BADM "):
-                        parts = response.split()
-                        if len(parts) < 3 or int(parts[1]) != slot:
-                            raise EngineError("batch admission returned the wrong slot")
-                        if parts[2] == "1":
-                            admitted = True
-                        elif parts[2] == "0" and admission_done:
-                            # A non-admitted request completed synchronously
-                            # through the preceding legacy T/DONE stream.
-                            serial_fallback = admission_tokens
-                        else:
-                            raise EngineError(f"batch admission rejected slot {slot}")
-                        break
-                    if response.startswith("ERR"):
-                        raise EngineError(response.strip())
-                    if response.startswith("T "):
-                        admission_tokens.append(int(response.split()[1]))
-                    elif response.startswith("DONE"):
-                        admission_done = True
-                    # PP and INFO also belong to serialized admission.
+                        if response.startswith("BADM "):
+                            parts = response.split()
+                            if len(parts) < 3 or int(parts[1]) != slot:
+                                raise EngineError("batch admission returned the wrong slot")
+                            if parts[2] == "1":
+                                admitted = True
+                            elif parts[2] == "0" and admission_done:
+                                serial_fallback = admission_tokens
+                            else:
+                                raise EngineError(f"batch admission rejected slot {slot}")
+                            pending = False
+                            if failure is not None:
+                                raise failure
+                            if check_active is not None:
+                                check_active()
+                            break
+                        if response.startswith("ERR"):
+                            raise EngineError(response.strip())
+                        if response.startswith("T "):
+                            admission_tokens.append(int(response.split()[1]))
+                        elif response.startswith("DONE"):
+                            admission_done = True
+                        # PP and INFO also belong to serialized admission.
+                finally:
+                    if pending:
+                        # Fail closed: no new owner may consume delayed BADM.
+                        # Already admitted tagged peers remain independent.
+                        self.admission_broken = True
 
             if serial_fallback is not None:
                 for token in serial_fallback:
@@ -374,6 +415,8 @@ class Engine:
                 n += 1
                 yield token
             while True:
+                if check_active is not None:
+                    check_active()
                 if time.time() - started > GEN_TIMEOUT_S:
                     raise EngineError(f"generation timed out for slot {slot}")
                 try:
@@ -399,7 +442,8 @@ class Engine:
                     raise EngineError(response.strip())
         finally:
             if admitted and not completed:
-                self.stop(slot)
+                if not stop_sent:
+                    self.stop(slot)
                 self.drain(slot=slot)
             # A rejected admission cannot have active output, but remove any
             # malformed/stale tagged lines before this numeric slot is reused.
@@ -408,7 +452,8 @@ class Engine:
                     self.slot_lines[slot].get_nowait()
                 except queue.Empty:
                     break
-            self.free_slots.put(slot)
+            if not pending or not self.alive():
+                self.free_slots.put(slot)
 
     def free(self):
         """QUIT the engine and release GPU/RAM."""
@@ -1058,6 +1103,8 @@ class StrataBackend(pb_grpc.BackendServicer):
         # two BGEN slots and admits at most two request transactions.
         self.gen_lock = threading.Semaphore(getattr(self.engine, "parallel", 1))
         self.load_lock = threading.Lock()
+        self.free_lock = threading.Lock()
+        self.stopping = False
         # stop markers: ChatML frame tokens plus the engine's end-of-text token
         stop_text = cfg.get("stop_tokens") or [
             IM_END, IM_START,
@@ -1082,11 +1129,15 @@ class StrataBackend(pb_grpc.BackendServicer):
                 f"model mismatch: this backend holds {self.cfg['model_name']!r}, requested {identity!r}")
 
     def _ensure_loaded(self):
+        if self.stopping:
+            raise EngineError("backend is stopping")
         if not self.engine.alive():
             self.load()
 
     def load(self) -> str:
         with self.load_lock:
+            if getattr(self, "stopping", False):
+                raise EngineError("backend is stopping")
             if self.engine.alive() and (not self.vision_cfg or self.vision and self.vision.alive()):
                 return "already loaded"
             print(f"[strata-backend] LoadModel: starting the engine for {self.cfg['model_name']}", flush=True)
@@ -1097,7 +1148,11 @@ class StrataBackend(pb_grpc.BackendServicer):
                         self.vision.close()
                     self.vision = Vision(self.vision_cfg, self.engine._env())
                     self.vision.start()
+                if self.stopping:
+                    raise EngineError("backend is stopping")
                 self.engine.start()
+                if self.stopping:
+                    raise EngineError("backend is stopping")
             except Exception:
                 if self.vision is not None:
                     self.vision.close()
@@ -1108,18 +1163,40 @@ class StrataBackend(pb_grpc.BackendServicer):
                   f"vision={'cpu' if self.vision else 'off'})", flush=True)
             return "loaded"
 
-    def free(self):
+    def free(self, timeout_s=None):
         permits = getattr(self.engine, "parallel", 1)
-        for _ in range(permits):
-            self.gen_lock.acquire()
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        acquired = 0
+        loaded_lock = freeing_lock = False
+        def acquire(lock):
+            if deadline is None:
+                return lock.acquire()
+            return lock.acquire(timeout=max(0, deadline - time.monotonic()))
         try:
+            # Only one unload may accumulate permits. Otherwise two Free
+            # callers can each hold one of two permits forever.
+            freeing_lock = acquire(self.free_lock)
+            if not freeing_lock:
+                return False
+            for _ in range(permits):
+                if not acquire(self.gen_lock):
+                    return False
+                acquired += 1
+            loaded_lock = acquire(self.load_lock)
+            if not loaded_lock:
+                return False
             self.engine.free()
             if self.vision is not None:
                 self.vision.close()
                 self.vision = None
+            return True
         finally:
-            for _ in range(permits):
+            if loaded_lock:
+                self.load_lock.release()
+            for _ in range(acquired):
                 self.gen_lock.release()
+            if freeing_lock:
+                self.free_lock.release()
 
     def _prepare_images(self, sources, ids):
         if not sources:
@@ -1174,7 +1251,7 @@ class StrataBackend(pb_grpc.BackendServicer):
             keys += f" seed={int(o.Seed)}"
         return keys
 
-    def _generate(self, ids, max_new, keys, embeddings=None):
+    def _generate(self, ids, max_new, keys, embeddings=None, check_active=None):
         """Run one legacy or batch request; yield token ids and return metadata."""
         self._ensure_loaded()
         if getattr(self.engine, "parallel", 1) == 2:
@@ -1183,7 +1260,7 @@ class StrataBackend(pb_grpc.BackendServicer):
                   f"max_new={max_new}{keys or ' (engine defaults)'}", flush=True)
             started = time.time()
             n = 0
-            batch = self.engine.batch_generate(max_new, keys, ids, embeddings)
+            batch = self.engine.batch_generate(max_new, keys, ids, embeddings, check_active)
             try:
                 while True:
                     try:
@@ -1210,9 +1287,11 @@ class StrataBackend(pb_grpc.BackendServicer):
         started = time.time()
         n = 0
         while True:
+            if check_active is not None:
+                check_active()
+            if getattr(self, "stopping", False):
+                raise EngineError("backend is stopping")
             if time.time() - started > GEN_TIMEOUT_S:
-                self.engine.stop()
-                self.engine.drain()
                 raise EngineError("generation timed out")
             try:
                 line = self.engine.lines.get(timeout=1.0)
@@ -1241,12 +1320,18 @@ class StrataBackend(pb_grpc.BackendServicer):
                 return {"tokens": n, "elapsed": elapsed}
 
     def _stream(self, o, streaming=True, retry_count=0, retry_prompt=None,
-                _transaction=False):
+                _transaction=False, context=None):
         """Validate tool turns before publishing any executable calls.
 
         Buffer tool-enabled turns so a failed attempt's prose cannot disable
         recovery. A committed valid call is never regenerated or replayed.
         """
+        def check_active():
+            if getattr(self, "stopping", False):
+                raise EngineError("backend is stopping")
+            if context is not None and hasattr(context, "is_active") and not context.is_active():
+                raise EngineError("request cancelled")
+        check_active()
         dialect = getattr(self, 'cfg', {}).get('tool_call_format', 'json')
         if streaming and not _transaction and _tool_system_block(o.Tools or "", dialect):
             original = retry_prompt if retry_prompt is not None else o.Prompt
@@ -1261,17 +1346,19 @@ class StrataBackend(pb_grpc.BackendServicer):
                 IM_START + "assistant\n"
             )
             for attempt in range(retry_count, 3):
+                check_active()
                 try:
                     pending = list(self._stream(
                         o, streaming=True, retry_count=attempt,
                         retry_prompt=original if attempt == retry_count else original + reminder,
-                        _transaction=True))
+                        _transaction=True, context=context))
                 except ToolFormatError:
                     if attempt == 2:
                         raise
                     print(f"[strata-backend] regenerating rejected turn ({attempt + 1}/2)",
                           flush=True)
                     continue
+                check_active()
                 yield from pending
                 return
         self._check_identity(o.ModelIdentity)
@@ -1444,14 +1531,22 @@ class StrataBackend(pb_grpc.BackendServicer):
             return None
 
         with self.gen_lock:
-            gen = (self._generate(ids, max_new, keys, embeddings) if embeddings is not None
-                   else self._generate(ids, max_new, keys))
+            gen = None
+            generation_complete = False
             try:
+                check_active()
+                if context is not None and hasattr(context, "is_active"):
+                    gen = self._generate(ids, max_new, keys, embeddings, check_active)
+                else:
+                    gen = (self._generate(ids, max_new, keys, embeddings) if embeddings is not None
+                           else self._generate(ids, max_new, keys))
                 while True:
                     try:
+                        check_active()
                         tid = gen.send(None)
                     except StopIteration as e:
                         finished = e.value or finished
+                        generation_complete = True
                         break
                     if tid in getattr(self, 'think_open_ids', set()):
                         inside_think = True
@@ -1479,6 +1574,7 @@ class StrataBackend(pb_grpc.BackendServicer):
                         if getattr(self.engine, "parallel", 1) == 1:
                             self.engine.stop()
                             self.engine.drain()
+                        generation_complete = True
                         break
                     tok_idx += 1
                     # Incremental decoders receive NEW bytes exactly once.
@@ -1517,6 +1613,7 @@ class StrataBackend(pb_grpc.BackendServicer):
                             if getattr(self.engine, "parallel", 1) == 1:
                                 self.engine.stop()
                                 self.engine.drain()
+                            generation_complete = True
                             # Finalize the parser and validate this attempt just
                             # as on engine EOF; a stop prompt is not acceptance.
                             break
@@ -1526,40 +1623,45 @@ class StrataBackend(pb_grpc.BackendServicer):
                         rep = make_reply(rs_part, ct_part, tools)
                         if rep:
                             yield rep
-            except GeneratorExit:
-                gen.close()
-                if getattr(self.engine, "parallel", 1) == 1:
-                    self.engine.stop()
-                    self.engine.drain()
+                # trailing bytes that the incremental decoder still holds
+                tail = dec.decode(b"", final=True)
+                raw += tail
+                if inside_think:
+                    rs_part, ct_part, tools = tail, "", []
+                else:
+                    rs_part, ct_part, tools = consume(tail, closing=True)
+                cd_reason += rs_part
+                cd_content += ct_part
+                if cd_reason[rs_sent:] or cd_content[ct_sent:] or tools:
+                    yield make_reply(cd_reason[rs_sent:], cd_content[ct_sent:], tools)
+                if ambiguous_tool_suffix and (dialect == 'native_xml' or tool_parser.any_xml_call):
+                    print('[strata-backend] failed tool turn: ambiguous native suffix; no calls published', flush=True)
+                    raise ToolFormatError('Ambiguous native tool turn; no calls published')
+                rejection_echo = cd_content.strip() == (
+                    "Tool call rejected: invalid format. Retry with an offered tool.")
+                if streaming and tc_index == 0 and tool_specs and (
+                        invalid_seen or rejection_echo or not cd_content.strip()):
+                    print('[strata-backend] failed tool turn: '
+                          f'invalid={invalid_seen} echo={rejection_echo} '
+                          f'reason_chars={len(cd_reason)} content_chars={len(cd_content)} '
+                          f'generated_tokens={tok_idx} inside_think={inside_think} '
+                          f'post_think={post_think} '
+                          f'tool_marker_in_reason={"<tool_call>" in cd_reason}', flush=True)
+                    raise ToolFormatError("Invalid, empty or incomplete tool turn; no calls published")
+
+            except BaseException:
+                # Cleanup belongs to this generation, never to an outer RPC.
+                if gen is not None:
+                    gen.close()
+                    if not generation_complete and getattr(self.engine, "parallel", 1) == 1:
+                        self.engine.stop()
+                        self.engine.drain()
                 raise
             finally:
+                if gen is not None:
+                    gen.close()
                 if embeddings is not None:
                     embeddings.unlink(missing_ok=True)
-        # trailing bytes that the incremental decoder still holds
-        tail = dec.decode(b"", final=True)
-        raw += tail
-        if inside_think:
-            rs_part, ct_part, tools = tail, "", []
-        else:
-            rs_part, ct_part, tools = consume(tail, closing=True)
-        cd_reason += rs_part
-        cd_content += ct_part
-        if cd_reason[rs_sent:] or cd_content[ct_sent:] or tools:
-            yield make_reply(cd_reason[rs_sent:], cd_content[ct_sent:], tools)
-        if ambiguous_tool_suffix and (dialect == 'native_xml' or tool_parser.any_xml_call):
-            print('[strata-backend] failed tool turn: ambiguous native suffix; no calls published', flush=True)
-            raise ToolFormatError('Ambiguous native tool turn; no calls published')
-        rejection_echo = cd_content.strip() == (
-            "Tool call rejected: invalid format. Retry with an offered tool.")
-        if streaming and tc_index == 0 and tool_specs and (
-                invalid_seen or rejection_echo or not cd_content.strip()):
-            print('[strata-backend] failed tool turn: '
-                  f'invalid={invalid_seen} echo={rejection_echo} '
-                  f'reason_chars={len(cd_reason)} content_chars={len(cd_content)} '
-                  f'generated_tokens={tok_idx} inside_think={inside_think} '
-                  f'post_think={post_think} '
-                  f'tool_marker_in_reason={"<tool_call>" in cd_reason}', flush=True)
-            raise ToolFormatError("Invalid, empty or incomplete tool turn; no calls published")
 
     # -- gRPC surface ------------------------------------------------------
 
@@ -1595,11 +1697,16 @@ class StrataBackend(pb_grpc.BackendServicer):
             prompt_tokens = 0
             # Aggregate the streaming path so non-SSE requests share its
             # safe raw suppression and bounded tool-only regeneration.
-            for reply in self._stream(request, streaming=True):
-                text_parts.append(reply.message.decode("utf-8", "replace"))
-                chat_deltas.extend(reply.chat_deltas)
-                tokens = max(tokens, reply.tokens)
-                prompt_tokens = reply.prompt_tokens
+            stream = self._stream(request, streaming=True, context=context)
+            try:
+                for reply in stream:
+                    text_parts.append(reply.message.decode("utf-8", "replace"))
+                    chat_deltas.extend(reply.chat_deltas)
+                    tokens = max(tokens, reply.tokens)
+                    prompt_tokens = reply.prompt_tokens
+            finally:
+                if hasattr(stream, "close"):
+                    stream.close()
             # Preserve the same structured contract as PredictStream. Dropping
             # deltas lets LocalAI reparse raw reasoning/rejected tool markup.
             text = (''.join(getattr(d, 'content', '') for d in chat_deltas) if chat_deltas
@@ -1607,18 +1714,12 @@ class StrataBackend(pb_grpc.BackendServicer):
             return pb.Reply(message=text.encode("utf-8"), tokens=tokens,
                             prompt_tokens=prompt_tokens, chat_deltas=chat_deltas)
         except Exception as e:
-            if self.engine.alive():
-                self.engine.drain()
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     def PredictStream(self, request, context):
         try:
-            yield from self._stream(request)
+            yield from self._stream(request, context=context)
         except Exception as e:
-            # an aborted/crashed generation leaves engine lines in the queue;
-            # drain them so the next request cannot read the old conversation
-            if self.engine.alive():
-                self.engine.drain()
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     def TokenizeString(self, request, context):
@@ -1655,14 +1756,15 @@ def main():
     tok = build_tokenizer(cfg)
     backend = StrataBackend(cfg, tok)
 
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+
     def shutdown(*_):
-        backend.free()
-        sys.exit(0)
+        backend.stopping = True
+        # Close admission and cancel active RPCs before waiting for owners.
+        server.stop(0)
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
     pb_grpc.add_BackendServicer_to_server(backend, server)
     bound = server.add_insecure_port(f"{a.host}:{a.port}")
     if bound == 0:
@@ -1670,7 +1772,14 @@ def main():
         return 1
     server.start()
     print(f"[strata-backend] listening on {a.host}:{a.port}, model={cfg['model_name']}", flush=True)
-    server.wait_for_termination()
+    try:
+        server.wait_for_termination()
+    finally:
+        if not backend.stopping:
+            shutdown()
+        if not backend.free(timeout_s=30):
+            print("[strata-backend] shutdown: timed out waiting for generation/load owners",
+                  file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

@@ -70,6 +70,151 @@ class ProtocolHarness:
 
 
 class BatchProtocolTests(unittest.TestCase):
+    def test_pending_admission_cancel_retains_owner_until_reconciled(self):
+        for reason in ('cancelled', 'stopping'):
+            for accepted in (True, False):
+                with self.subTest(reason=reason, accepted=accepted):
+                    engine = Engine({'parallel': 2})
+                    engine.proc = FakeProc()
+                    engine.ended = False
+                    engine.can_stop = True
+                    sent = threading.Event()
+                    cancelled = threading.Event()
+                    stopped = threading.Event()
+                    peer_sent = threading.Event()
+                    commands = []
+                    slots = []
+                    def route(text):
+                        engine._route_line(text + '\n')
+                    def send(line):
+                        commands.append(line)
+                        parts = line.split()
+                        slot = int(parts[1])
+                        if parts[0] == 'BGEN':
+                            slots.append(slot)
+                            if len(slots) == 1:
+                                sent.set()
+                            else:
+                                route(f'BADM {slot} 1')
+                                route(f'BT {slot} 202')
+                                route(f'BDONE {slot} 1 stop 1')
+                                peer_sent.set()
+                        elif parts[0] == 'BSTOP':
+                            stopped.set()
+                    engine._send = send
+                    def check():
+                        if cancelled.is_set():
+                            raise EngineError(reason)
+                    pool = ThreadPoolExecutor(max_workers=2)
+                    a = pool.submit(lambda: list(engine.batch_generate(8, '', [1], check_active=check)))
+                    try:
+                        self.assertTrue(sent.wait(1))
+                        cancelled.set()
+                        peer = pool.submit(lambda: list(engine.batch_generate(8, '', [2])))
+                        observed_stop = stopped.wait(1.5)
+                        early_peer = peer_sent.is_set()
+                        owner_finished = a.done()
+                        # Simulate delayed prefill finishing only AFTER cancellation.
+                        route('T 999')
+                        route('DONE')
+                        route(f'BADM {slots[0]} {int(accepted)}')
+                        if accepted:
+                            route(f'BT {slots[0]} 666')
+                            route(f'BDONE {slots[0]} 1 cancelled 1')
+                        with self.assertRaisesRegex(EngineError, reason):
+                            a.result(3)
+                        self.assertEqual(peer.result(3), [202])
+                        self.assertTrue(observed_stop, 'pending BGEN cancellation was not polled')
+                        self.assertFalse(early_peer, 'unreconciled admission owner was reused')
+                        self.assertFalse(owner_finished, 'pending numeric slot was released')
+                        self.assertEqual(engine.available_slots(), 2)
+                        self.assertEqual([c for c in commands if c.startswith('BSTOP')], [f'BSTOP {slots[0]}'])
+                        self.assertTrue(engine.lines.empty())
+                    finally:
+                        pool.shutdown(wait=True)
+
+    def test_unreconciled_admission_quarantines_slot_without_stopping_active_peer(self):
+        engine = Engine({'parallel': 2})
+        engine.proc = FakeProc()
+        engine.ended = False
+        engine.can_stop = True
+        commands = []
+        clock = [0.0]
+        generations = []
+        def send(line):
+            commands.append(line)
+            if line.startswith('BGEN '):
+                slot = int(line.split()[1])
+                generations.append(slot)
+                if len(generations) == 1:
+                    engine._route_line(f'BADM {slot} 1\n')
+                    engine._route_line(f'BT {slot} 101\n')
+            elif line.startswith('BSTOP '):
+                # Advance across the cleanup bound after the next empty read.
+                engine.lines = ExpiringQueue()
+        class ExpiringQueue(queue.Queue):
+            def get(self, *args, **kwargs):
+                clock[0] += 121
+                raise queue.Empty
+        saved_time, saved_timeout = NS['time'], NS['GEN_TIMEOUT_S']
+        NS['time'] = SimpleNamespace(time=lambda: clock[0])
+        NS['GEN_TIMEOUT_S'] = 3600
+        peer = engine.batch_generate(8, '', [1])
+        engine._send = send
+        try:
+            self.assertEqual(next(peer), 101)
+            checks = []
+            def cancel_after_send():
+                checks.append(1)
+                if len(generations) == 2:
+                    raise EngineError('cancelled')
+            with self.assertRaisesRegex(EngineError, 'unreconciled'):
+                list(engine.batch_generate(8, '', [2], check_active=cancel_after_send))
+            self.assertEqual(engine.available_slots(), 0, 'unresolved slot must be quarantined')
+            with self.assertRaisesRegex(EngineError, 'unreconciled'):
+                list(engine.batch_generate(8, '', [3]))
+            engine._route_line(f'BT {generations[0]} 102\n')
+            engine._route_line(f'BDONE {generations[0]} 2 stop 1\n')
+            self.assertEqual(list(peer), [102])
+            self.assertEqual(engine.available_slots(), 1)
+            self.assertEqual([c for c in commands if c.startswith('BSTOP')], [f'BSTOP {generations[1]}'])
+        finally:
+            peer.close()
+            NS['time'], NS['GEN_TIMEOUT_S'] = saved_time, saved_timeout
+
+    def test_admission_timeout_reconciles_late_badm_before_raising(self):
+        engine = Engine({'parallel': 2})
+        engine.proc = FakeProc()
+        engine.ended = False
+        engine.can_stop = True
+        clock = [0.0]
+        commands = []
+        class DelayedQueue(queue.Queue):
+            def get(self, *args, **kwargs):
+                if self.empty():
+                    clock[0] += 3
+                    raise queue.Empty
+                return super().get(*args, **kwargs)
+        engine.lines = DelayedQueue()
+        def send(line):
+            commands.append(line)
+            if line.startswith('BSTOP '):
+                slot = int(line.split()[1])
+                engine._route_line(f'BADM {slot} 1\n')
+                engine._route_line(f'BDONE {slot} 0 cancelled 1\n')
+        engine._send = send
+        saved = NS['time']
+        NS['time'] = SimpleNamespace(time=lambda: clock[0])
+        try:
+            with self.assertRaisesRegex(EngineError, 'timed out'):
+                list(engine.batch_generate(8, '', [1]))
+            self.assertFalse(engine.admission_broken)
+            self.assertEqual(engine.available_slots(), 2)
+            self.assertEqual(commands, ['BGEN 0 8 1', 'BSTOP 0'])
+            self.assertTrue(engine.lines.empty())
+        finally:
+            NS['time'] = saved
+
     def test_parallel_defaults_to_legacy_serial_protocol(self):
         engine = Engine({})
         self.assertEqual(engine.parallel, 1)
