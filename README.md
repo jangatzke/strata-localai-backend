@@ -1,104 +1,141 @@
 # Strata ↔ LocalAI gRPC Bridge
 
-A Python external backend for [LocalAI](https://github.com/mudler/LocalAI) that runs the [Strata](https://github.com/Niko1221/Strata) inference engine and exposes it as an OpenAI-compatible chat model through LocalAI. The engine, model weights and tokenizer pack are **not** included.
+A Python external backend for [LocalAI](https://github.com/mudler/LocalAI) that runs the [Strata](https://github.com/Niko1221/Strata) inference engine and exposes it as an OpenAI-compatible chat model through LocalAI. The engine, model weights, vision projector and tokenizer pack are **not** included.
 
-This repository captures the working bridge deployed for `qwen3.8-flash-next-strata`. It is tied to Strata's `--serve` stdin/stdout protocol (legacy `GEN` or two-slot `BGEN` mode) and LocalAI's gRPC `backend.Backend` protocol; it is not a general-purpose LocalAI backend for arbitrary engines.
+This bridge targets Strata's `--serve` stdin/stdout protocol and LocalAI's gRPC `backend.Backend` protocol. It is not a general-purpose backend for arbitrary engines. The examples use the dedicated, non-login service account **`stratal`**, not an interactive administrator. Existing installations may use another account; changing these examples does not migrate an existing service.
 
 ## Architecture
 
 ```text
-OpenAI-compatible client (e.g. Zoo Code)
+OpenAI-compatible client
     → LocalAI /v1/chat/completions
     → external gRPC backend on port 50053
-    → Strata engine --serve + model pack/tokenizer
+    → Strata text engine --serve + model pack/tokenizer
+      + optional CPU strata-vision image encoder
 ```
 
-`LoadModel` starts Strata and waits for `READY`; `Predict` and `PredictStream` tokenize ChatML prompts and process generated token IDs; `Free` stops the engine and releases GPU/RAM. Set top-level `"parallel": 2` to enable exactly two concurrent bridge request slots. The bridge appends `--batch 2` unless engine `args` already contain upstream `--batch` or `--slots` syntax, which is preserved unchanged. If `parallel` is absent or `1`, the bridge retains serialized `GEN`/`GENI` behavior. Other root-level values are rejected, and batch startup fails unless the engine reports at least two slots in `INFO batch_slots=N`. Batch requests use `BGEN`/`BGENI`, `BADM`, `BT`, `BDONE`, and request-scoped `BSTOP`. Streaming tool calls are converted into structured `ChatDelta.tool_calls`. The parser accepts the native JSON tool format and a schema-bound XML-like fallback seen in Zoo Code. Malformed tool-call *blocks* fail closed: no guessed tool execution or raw block in streaming content. This does not guarantee that a model can never produce some other unrecognized syntax.
+`LoadModel` starts the configured engine and waits for `READY`. `Predict` and `PredictStream` tokenize ChatML prompts and convert token IDs into structured content, reasoning and tool-call deltas. `Free` unloads the text/vision processes and releases resources; a later request can load them again. The separate Strata `server.py` is not required and must not hold the same model's resources while the bridge is serving it.
+
+The example defaults to **`parallel: 1`**, the serial `GEN`/`GENI` path. Set top-level `"parallel": 2` for exactly two request slots using `BGEN`/`BGENI`, `BADM`, `BT`, `BDONE` and slot-scoped `BSTOP`. The bridge adds `--batch 2` unless engine arguments already contain `--batch`/`--slots` syntax. Those arguments are preserved; the engine must report at least two slots in `INFO batch_slots=N`. Other root-level `parallel` values are rejected. Two slots do not guarantee two active decoders during every phase: admission/prefill is serialized, and the engine may finish an admission via its legacy compatibility path.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `strata_grpc_backend.py` | Bridge implementation and tool-stream parser |
-| `backend.proto` | Matching LocalAI backend protocol; generate Python stubs from it |
-| `qwen3.8-flash-next-strata.yaml` | LocalAI model config and ChatML templates |
-| `strata-backend.example.json` | Example Strata paths and engine arguments for the deployed IQ3_S setup; edit for your host |
-| `run.sh`, `strata-localai-backend.service` | Sample launcher and systemd unit (paths/user are host-specific) |
-| `test_parser.py` | Deterministic parser and bridge streaming regressions |
-| `test_live_stream.py` | Live LocalAI SSE smoke test |
+| `strata_grpc_backend.py` | Engine/vision lifecycle, gRPC surface and tool-stream parser |
+| `backend.proto` | LocalAI protocol used to generate Python stubs |
+| `qwen3.8-flash-next-strata.yaml` | LocalAI model configuration and chat/history/image templates |
+| `strata-backend.example.json` | Host-specific HIP/IQ3_S example, including CPU vision |
+| `run.sh`, `strata-localai-backend.service` | Launcher and hardened systemd example using `stratal` |
+| `test_parser.py`, `test_recovery.py` | Deterministic parser, streaming and bounded-recovery regressions |
+| `test_batch.py`, `test_vision.py`, `test_lifecycle.py` | Batch routing, image protocol, cleanup/cancellation and shutdown regressions |
+| `test_recovery_grpc.py` | CPU-only real-gRPC recovery/exhaustion fixtures |
+| `test_live_stream.py`, `test_live_history.py` | Live LocalAI probes; generated calls are never executed |
 
 ## Requirements
 
-- A built Strata checkout with the matching `engine/strata --serve` protocol, a model pack, tokenizer files, and GPU runtime for that build. The example uses ROCm/HIP and an IQ3_S Qwen3.8 Flash Next pack.
-- Python 3.10+ (the deployed service uses Python 3.14), `grpcio`, `grpcio-tools`, and `regex` (used by Strata's tokenizer).
-- LocalAI with support for external gRPC backends and structured `Reply.chat_deltas`, using the `backend.proto` version in this repository. The deployed LocalAI source revision was `3d63736`; other versions may need a matching proto and streaming behavior check.
+- A matching built Strata checkout, model pack, tokenizer files and runtime libraries. The example uses ROCm/HIP, a Qwen3.8 Flash Next IQ3_S pack and Python 3.14 ROCm library paths; these are **not portable defaults**.
+- Python 3.10+ with `venv`/pip support and the dependencies in `requirements.txt`. The reference deployment uses Python 3.14. Match `lib_dirs` to the Python version and GPU architecture of the **Strata build's** environment, which may differ from the bridge venv.
+- LocalAI supporting external gRPC backends and structured `Reply.chat_deltas`. This repository's proto comes from LocalAI revision `3d63736`; other versions need a compatibility check.
+- For the example image setup: a built `strata-vision`, a compatible `mmproj` and model shard. Keep the `vision` block **and** text-engine `--vision` flag together. For text-only use, remove both. The model YAML contains an image template but does not install a vision encoder. JPEG/PNG/BMP/GIF signatures pass through without Pillow; converting other formats requires optional Pillow (`./venv/bin/python -m pip install Pillow`). Encoder support for the supplied format is still required.
+- On the HIP example host, systemd grants the service the `render` supplementary group. Check `/dev/kfd` and render-node permissions on your distribution and adapt GPU groups as necessary. A plain `sudo -u stratal` invocation does not automatically reproduce a unit-only supplementary group.
 
-## Install on the inference host
+## Fresh installation on the inference host
 
-For a **fresh** installation, clone this repository into a directory owned by the intended service user (the example unit expects `/srv/strata-localai-backend`). Do not clone over an existing deployment. Adjust paths, service user, model ID, and interface to suit your host. Do not run a second standalone Strata server against the same model at the same time.
+Do not run this recipe over an existing deployment. Provision Strata and its model/pack files separately under `/srv/stratal/Strata` and `/srv/stratal/Strata-data`, with service-user read/execute access and appropriate write access for Strata's caches. Do not grant broad write access to `/srv`.
 
 ```bash
-# Ensure /srv permits the service user to create the target directory first.
-git clone https://github.com/jangatzke/strata-localai-backend.git /srv/strata-localai-backend
-cd /srv/strata-localai-backend
-python3.14 -m venv venv
-./venv/bin/python -m pip install -r requirements.txt
-./venv/bin/python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. backend.proto
-cp strata-backend.example.json strata-backend.json
-# Edit strata-backend.json: exe, args, cwd, tokenizer, log, lib_dirs, gpu and env.
-chmod +x run.sh
-# Adapt and install strata-localai-backend.service under /etc/systemd/system/.
-# Then systemctl daemon-reload, enable and start the service.
+# Fresh Linux host only; adapt the nologin path and GPU groups as needed.
+sudo useradd --system --user-group --create-home \
+  --home-dir /var/lib/stratal --shell /usr/sbin/nologin stratal
+sudo install -d -o stratal -g stratal -m 0750 \
+  /srv/strata-localai-backend /srv/stratal /var/log/stratal
+sudo -u stratal env HOME=/var/lib/stratal git clone \
+  https://github.com/jangatzke/strata-localai-backend.git /srv/strata-localai-backend
+sudo -u stratal sh -c 'cd /srv/strata-localai-backend && \
+  python3.14 -m venv venv && \
+  ./venv/bin/python -m pip install -r requirements.txt && \
+  ./venv/bin/python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. backend.proto && \
+  cp strata-backend.example.json strata-backend.json && \
+  chmod +x run.sh'
+# Edit strata-backend.json and the sample unit for your host BEFORE starting.
+sudo install -o root -g root -m 0644 /srv/strata-localai-backend/strata-localai-backend.service \
+  /etc/systemd/system/strata-localai-backend.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now strata-localai-backend
 ```
 
-The example JSON contains paths from one deployment, **not portable defaults**. `run.sh` currently binds gRPC to `0.0.0.0:50053`; restrict that port with a firewall or bind it to an appropriate reachable interface. The example systemd unit runs as `jan` and assumes `/srv/strata-localai-backend`, so adapt its user and paths before installing it.
+Substitute another installed Python 3.10+ for `python3.14` if appropriate; this does not change the ROCm paths in the JSON automatically. The sample unit hides `/home`, so its model and library paths intentionally live under `/srv/stratal`, with state/cache/log directories managed by systemd under `/var/lib/stratal`, `/var/cache/stratal` and `/var/log/stratal`.
 
-Configure LocalAI's `external_backends.json` with an address reachable from its container, for example:
+Review every JSON path, especially `exe`, `cwd`, `strata_repo_tools`, tokenizer, pack/shards, MTP data, expert profile, control vector, vision projector, `lib_dirs` and tuning file. The supplied performance flags and experimental control vector are hardware/model-specific choices, not universal recommendations. Remove optional arguments together with all their values when their assets are unavailable. `gpu: 0` refers to the runtime device index, not a stable PCI identity.
+
+`run.sh` binds gRPC to `0.0.0.0:50053` by default (`PORT` overrides the port; `HOST` overrides the bind address). This gRPC listener has **no authentication or TLS**. Restrict access to LocalAI/trusted hosts with a firewall or private interface; never expose it publicly. `127.0.0.1` is reachable only from the same network namespace, so a container on another namespace needs a reachable host address.
+
+Configure LocalAI's `external_backends.json`, using the actual reachable address:
 
 ```json
 {"strata": "YOUR_INFERENCE_HOST:50053"}
 ```
 
-Place `qwen3.8-flash-next-strata.yaml` in LocalAI's model directory and ensure its `backend: strata` matches that mapping. Start the bridge service. LocalAI hot-reloads the external backend mapping, but newly added or changed model YAML templates may require a LocalAI restart. Do not restart unrelated containers.
+Place `qwen3.8-flash-next-strata.yaml` in LocalAI's model directory; its `backend: strata` must match the mapping and its model identity must match `model_name` in the bridge JSON. LocalAI hot-reloads the backend mapping; adding/changing model templates can require restarting **LocalAI**. A Python-only bridge update requires restarting **only the bridge**. Neither requires a host reboot or restarting unrelated containers.
 
 ## Verify
 
-Unit regressions do **not** require a running engine:
+Generate the protobuf stubs and install requirements first. Run CPU regressions with the bridge venv from the checkout; they use fake engines and do not load a GPU model:
 
 ```bash
-python3 -m unittest -q test_parser test_recovery test_batch test_vision
-python3 -m py_compile strata_grpc_backend.py
+./venv/bin/python -m unittest -q \
+  test_parser test_recovery test_batch test_vision test_lifecycle
+./venv/bin/python test_recovery_grpc.py
+./venv/bin/python -m py_compile strata_grpc_backend.py
 ```
 
-With both the bridge and LocalAI running:
+Run `test_recovery_grpc.py` as a separate process: it mutates fixture state and executes assertions directly. If using pytest, select the five CPU test files explicitly; unrestricted collection imports the live SSE probe and can contact LocalAI. pytest is optional and is not installed by `requirements.txt`.
+
+With LocalAI and the bridge running, set the API URL and, for authenticated LocalAI, `LOCALAI_API_KEY` in your environment (do not put real keys in source or shell history):
 
 ```bash
-LOCALAI_BASE_URL=http://YOUR_LOCALAI_HOST:8081/v1 python3 test_live_stream.py
-LOCALAI_BASE_URL=http://YOUR_LOCALAI_HOST:8081/v1 python3 test_live_history.py
+export LOCALAI_BASE_URL=http://YOUR_LOCALAI_HOST:8081/v1
+export LOCALAI_MODEL=qwen3.8-flash-next-strata
+./venv/bin/python test_live_stream.py
+./venv/bin/python test_live_history.py
 ```
 
-The smoke test checks for `finish_reason: tool_calls`, an offered `update_todo_list` call, and no raw tool markup in SSE content. It does not force the model to reproduce every malformed dialect. Also verify a non-streaming completion and a follow-up turn containing the tool result for your client. Bridge status: `systemctl status strata-localai-backend`; logs: `journalctl -u strata-localai-backend -f`. The engine may take tens of seconds to load on the first request.
+The SSE probe checks offered `update_todo_list` tool calls, `finish_reason: tool_calls` and absence of raw tool markup. The history probe checks five consecutive non-streaming turns with exact Unicode arguments, feeding actual tool calls back with an explicit **not executed** harness result. Neither probe executes returned calls. Optional `LIVE_HISTORY_RESULTS` stores verification metadata, not arguments/session text. These probes do not establish that every malformed dialect or long client session works.
 
-The history probe checks five consecutive non-streaming completions, feeding each actual assistant toolcall back into the next request with an explicit harness message stating that it was **not executed**. It verifies exact Unicode arguments and offered names without performing any file writes. `LOCALAI_MODEL` can select the model; optional `LIVE_HISTORY_RESULTS` stores only verification metadata, not arguments or session content. These fixtures do not replace a long real Telegram/Zoo session.
+Also check two distinct exact-marker text prompts back-to-back, an image with deterministic colors/positions, and a text request after the image. Verify each answer belongs to its own prompt, rather than relying on HTTP 200 or the model list. For `parallel: 2`, warm the engine and test distinguishable concurrent requests plus request-local cancellation; client wall-time overlap alone does not prove overlapping decode.
 
-## Operational notes
+Service status: `systemctl status strata-localai-backend`. Logs: `journalctl -u strata-localai-backend -f` and the JSON's engine `log` path. The first request loads the model and can take tens of seconds or minutes. The code allows up to 1200 seconds for engine READY and a 3600-second generation ceiling; client/proxy timeouts can be shorter.
 
-- Output length: a positive client `max_tokens` is passed through unchanged. When omitted or non-positive, the bridge does not impose a fixed output budget; because Strata's `GEN` protocol requires a positive integer, it uses the remaining engine context minus its eight-token safety margin. Reasoning and tool-call text both count toward any explicit client limit.
-- Tool-enabled turns are buffered until validation completes. Rejected turns are regenerated up to twice even when they contain a prose preamble. Failed prose/arguments are discarded, not replayed or logged. An exact standalone legacy rejection-text echo also triggers recovery. If any valid calls exist, they are published once; invalid neighbors are omitted and that turn is never regenerated. If all three attempts fail, gRPC returns an actual error, not a normal assistant rejection answer. Rejections include only fixed shape diagnostics (dialect, offered name, decoder error/offset), never argument values. Buffering delays tool-enabled output until the turn is complete; no-tools text still streams normally.
-- Tool envelope boundaries are JSON-string-aware: a closing tool-call marker inside a JSON string (including escaped quotes/backslashes, Markdown fences and arbitrary stream chunk boundaries) remains argument data. Only a marker outside a string closes the envelope; incomplete JSON still fails closed. String contents are never repaired by this boundary scanner.
-- Explicit thinking phases bypass the tool parser. Tool examples in reasoning are never executable and cannot switch the reply into content/rejection mode. A recognized think-close control token remains in the legacy raw wire format but is not appended to structured reasoning; quoted lookalike text and tool argument strings remain unchanged.
-- Non-streaming `Predict` aggregates the same safe path as `PredictStream`, returns structured chat deltas, and suppresses raw tool/argument markup instead of asking LocalAI to reparse it. Both paths share bounded transactional recovery; neither regenerates a turn containing a valid call.
-- Native XML boundaries walk function/parameter structure incrementally, preserving literal closing tags inside string values. Strings lose only the template's one outer newline at each end, not significant whitespace. Offered functions accept empty arguments when their schema has no required parameters. Missing required parameters, conflicting duplicates, unknown tools/parameters, malformed structure and truncated calls remain fail-closed.
-- `tool_call_format: native_xml` uses the active Strata pack's function/parameter dialect in both initial and recovery prompts; absent configuration retains the legacy `json` contract. The example enables `native_xml`. The LocalAI template marks API tool-history entries with `<bridge_tool_history>`; Python renders those entries in the configured dialect, preserving integer precision and raw string whitespace. User examples are not rewritten. Native assistant prefill ends in `<think>\n`, and stream parsing starts inside that thinking phase. Keep the bridge configuration and model template consistent.
-- Feed each new token byte block to the incremental UTF-8 decoder exactly once and finalize with empty input. Re-feeding cumulative bytes corrupts Unicode split across token boundaries.
-- Native/XML calls with non-whitespace suffix text invalidate the whole buffered turn, including provisionally parsed calls. Such text may be the remainder of a string whose literal closing-tag sequence was mistaken for structure. Recovery regenerates only this unpublished turn; exhaustion returns an RPC error without publishing a truncated writing call. This applies to the native contract and the XML fallback, while ordinary JSON-call neighbor handling remains unchanged. Raw native strings remain an inherently ambiguous encoding; do not claim every literal delimiter sequence can be safely represented.
-- Live validation is not a blanket guarantee: three API-only probes produced exact arguments after the native-contract change. An additional adversarial tool-history fixture produced a structured call but a non-exact file-content argument; that discrepancy and a long real Telegram continuation remain unverified. No generated probe tool was executed. A bridge rejection alone is not evidence of a model or context-length defect.
-- Diagnostics log prompt length and fixed parser-state/shape metadata only, not prompt excerpts, argument values or full failed conversations. Preserve this privacy boundary when adding probes.
-- A bridge-only Python change needs a bridge restart; a model YAML template change may need a LocalAI restart. A Zoo Code UI run is necessary before claiming its display is fixed.
-- Strata can leave tokens queued after a cancelled generation. The bridge drains to `DONE` (or a bounded idle timeout) before accepting the next request.
-- In `parallel: 2` mode, stdout is dispatched by slot: serialized admission consumes only its untagged compatibility output through matching `BADM`, while `BT`/`BDONE` are routed to per-slot queues. Cancellation sends `BSTOP <slot>` and requires that slot's `BDONE` before the numeric slot can be reused. Vision requests use `BGENI` and keep their request embedding file until that slot completes or drains.
-- The service expects generated `backend_pb2.py` and `backend_pb2_grpc.py` beside the bridge. They are intentionally not committed.
+## Generation and tool contract
+
+- A positive client `max_tokens` is used as the generation budget. When omitted/non-positive, the bridge uses remaining engine context minus an eight-token safety margin instead of imposing a fixed 4096-token default. For an omitted/non-positive limit, insufficient context is rejected; positive client limits are passed through without a bridge-side context-capacity check. Reasoning and tool text count toward the budget.
+- `tool_call_format: native_xml` uses the Strata pack's function/parameter dialect in both initial and corrective prompts. An absent setting retains the legacy `json` contract with a schema-bound XML-like fallback. The YAML marks API tool history with `bridge_tool_history`; Python renders it in the configured dialect, preserving numeric precision and string whitespace. User examples are not rewritten.
+- Tool-enabled streaming turns are buffered until validation completes. Rejected/empty turns may regenerate up to twice, discarding failed prose/arguments. A valid published call is never regenerated or replayed. Exhaustion raises an actual RPC error. This delays tool-enabled output; no-tools text still streams normally.
+- Accepted offered calls become structured `ChatDelta.tool_calls`; malformed/truncated envelopes and unknown tools fail closed, subject to the narrow final-report exception below. JSON envelopes check an offered function name and object arguments (including a JSON string that decodes to an object), but do **not** validate required properties, argument names or property types. XML checks offered parameter names, required keys, supported top-level types and duplicate-value consistency, not full nested JSON Schema or enums. Clients/tool executors must perform their own complete validation and authorization. JSON neighbor handling can omit invalid calls while preserving valid ones; ambiguous native/XML suffix text rejects the **whole unpublished turn**, including provisionally parsed calls.
+- One legacy compatibility heuristic can recover malformed JSON quotes/newlines in an offered `attempt_completion` with a string `result` property. Its greedy envelope matcher rebuilds a single `result` string, but does **not** prove the malformed input contained only one argument: apparent additional fields can be swallowed into the recovered report text. Do not treat it as strict envelope validation, a general repair mechanism or a safe repair path for side-effecting tools.
+- JSON envelope scanning is string/escape-aware. Closing markers inside a valid JSON string remain argument data across arbitrary stream boundaries. Native raw strings are inherently ambiguous for some literal delimiter sequences; do not claim arbitrary payloads are always representable. Native string values are not XML-unescaped or silently repaired; template formatting newlines and the legacy fallback have separate conventions.
+- Explicit thinking phases bypass the tool parser. Recognized thinking control tokens are not appended to structured reasoning. Each new byte block enters the incremental UTF-8 decoder once, and the decoder is finalized with empty input.
+- Non-streaming `Predict` aggregates the same safe path and retains structured chat deltas rather than asking LocalAI to reparse rejected/raw tool text. Diagnostics report lengths and fixed parser-state/shape metadata, not prompt excerpts or argument values.
+
+## Cleanup, cancellation and shutdown
+
+- Generation cleanup and parser finalization stay under the owning request's semaphore permit. Outer RPC error handlers do **not** drain the shared queue after releasing ownership. Completed/already-drained generations are not stopped or drained a second time.
+- Vision input accepts HTTP(S), local paths/`file://`, data URLs and raw base64. Remote URLs are fetched **by the bridge**, and local files are read with the service account’s permissions; there is no host/path allowlist. The default 50 MiB `max_image_bytes` limit is not an SSRF or file-access policy. Restrict untrusted callers and apply network/filesystem isolation before exposing vision to them.
+- gRPC cancellation is checked during output waits and buffered tool retries. Cancelled queued callers may still wait to acquire a semaphore/admission lock; they are checked before sending new work once admitted.
+- Serial cancellation stops/drains that generation before releasing ownership. Batch cancellation uses only `BSTOP <slot>` and drains that slot through `BDONE` before reuse, leaving admitted peers independent.
+- Cancellation during pending `BGEN` admission retains ownership until delayed `BADM` is reconciled, within a separate 120-second cleanup window. If it cannot be reconciled, the slot stays quarantined and new admissions fail closed until engine reload; already-admitted peers can finish. Image embedding files are request-local and removed on completion/cancellation.
+- Concurrent `Free` calls are serialized before accumulating generation permits. Normal unload permits subsequent reload. On SIGTERM/SIGINT, the bridge first marks itself stopping and closes gRPC admission; queued generation and new model loads are rejected before unload.
+- Shutdown bounds **lock acquisition** to 30 seconds, not total teardown. Engine/vision process waits and pending batch reconciliation can take longer. The sample unit has a 90-second stop timeout; systemd can force termination when that expires. Choose a larger timeout if your operational policy requires the full reconciliation window.
+
+## Safe updates and scope of verification
+
+Back up deployed code/configuration, stage the replacement separately, run CPU regressions under the service user's environment, install the tested files and restart only the required service. Read back the installed checksum and service state, then verify text, structured tools and vision through LocalAI. Do not replace an active configuration with the example JSON or rename an existing service account as a side effect of a documentation update.
+
+If maintenance requires a three-minute idle window, check both backend status and unchanged request/engine activity continuously for at least 180 seconds **before the first production write and restart**. New activity or missing evidence resets the window; an old log timestamp alone is not sufficient.
+
+Passing API probes establishes those specific paths, not every client's UI behavior, arbitrary native delimiter payload or long Telegram/Zoo continuation. Verify the affected real client separately before declaring its issue resolved.
 
 ## Third-party protocol notice
 
-`backend.proto` is copied without modification from [LocalAI `backend/backend.proto` at revision `3d63736`](https://github.com/mudler/LocalAI/blob/3d63736/backend/backend.proto), licensed under MIT. See `LICENSE.LocalAI` for the upstream license. This repository does not include Strata source code or model files.
+`backend.proto` is copied from [LocalAI `backend/backend.proto` at revision `3d63736`](https://github.com/mudler/LocalAI/blob/3d63736/backend/backend.proto), licensed under MIT. See `LICENSE.LocalAI`. This repository does not include Strata source code or model files.

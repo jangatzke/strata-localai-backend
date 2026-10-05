@@ -328,7 +328,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                '<tool_call>\n'
                '<function=execute_command>\n'
                '<parameter=command>\nnpm run build --workspace frontend\n</parameter>\n'
-               '<parameter=cwd>\nc:/Users/jan/Documents/Visual Studio Code/Asset Management\n</parameter>\n'
+               '<parameter=cwd>\nc:/Users/stratal/Documents/Visual Studio Code/Asset Management\n</parameter>\n'
                '<parameter=timeout>\n300\n</parameter>\n'
                '</function>\n</tool_call>')
         result = events(raw, specs={'execute_command': {
@@ -342,7 +342,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
         self.assertEqual(calls[0][1], 'execute_command')
         self.assertEqual(json.loads(calls[0][2]), {
             'command': 'npm run build --workspace frontend',
-            'cwd': 'c:/Users/jan/Documents/Visual Studio Code/Asset Management',
+            'cwd': 'c:/Users/stratal/Documents/Visual Studio Code/Asset Management',
             'timeout': 300,
         })
 

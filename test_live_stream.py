@@ -22,7 +22,9 @@ request_body = {
 }
 req = urllib.request.Request(base_url + '/chat/completions',
                              json.dumps(request_body).encode(),
-                             {'Content-Type': 'application/json'})
+                             {'Content-Type': 'application/json',
+                              **({'Authorization': 'Bearer ' + os.environ['LOCALAI_API_KEY']}
+                                 if os.environ.get('LOCALAI_API_KEY') else {})})
 content, calls, finishes = [], [], []
 with urllib.request.urlopen(req, timeout=420) as response:
     for line in response:

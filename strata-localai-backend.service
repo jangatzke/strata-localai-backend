@@ -1,14 +1,32 @@
 [Unit]
 Description=Strata LocalAI gRPC backend
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=jan
+User=stratal
+Group=stratal
+SupplementaryGroups=render
 WorkingDirectory=/srv/strata-localai-backend
 ExecStart=/srv/strata-localai-backend/run.sh
+StateDirectory=stratal
+CacheDirectory=stratal
+LogsDirectory=stratal
+Environment=HOME=/var/lib/stratal
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=90
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

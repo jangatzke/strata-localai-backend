@@ -8,12 +8,10 @@ threads: 8
 parameters:
   model: qwen3.8-flash-next-strata
 
-# Explicit tool-call format: the model emits Qwen3-native
-# <tool_call>\n{"name": ..., "arguments": {...}}\n</tool_call> which matches
-# the "xiaomi-mimo" preset (tool_call tag + JSON body). The preset makes
-# parsing deterministic but does NOT remove raw tag text from streamed
-# content. The bridge supplies parsed ChatDelta content + tool_calls to
-# prevent that leak in streaming clients such as Zoo Code.
+# Tool parsing is provided by structured Reply.chat_deltas from the bridge.
+# The legacy LocalAI JSON tool-envelope preset remains for compatibility; it
+# does not select the bridge dialect. strata-backend.json selects native_xml
+# or json. Keep that setting and the history markers below consistent.
 function:
   xml_format_preset: xiaomi-mimo
 
@@ -22,11 +20,10 @@ function:
 # assistant generation header. NOTE: the chat-level template does NOT see
 # per-message fields -- only .Input (joined chat_message outputs) -- so any
 # per-message markup must live in chat_message, not chat.
-# Tool-call history: assistant messages carrying tool_calls are re-rendered
-# as <tool_call> blocks (Qwen3-native) so the model sees which function
-# it called earlier; tool RESULTS are rendered as a user frame wrapped in
-# <tool_response> (Qwen3-native) -- a bare <|im_start|>tool role frame is
-# unknown to Qwen3 and made it emit im_end as its first token (empty replies).
+# API tool-call history is wrapped in bridge_tool_history JSON markers.
+# The bridge renders it in the configured native_xml or json dialect.
+# Tool results use a user frame wrapped in tool_response; a bare tool-role
+# frame is incompatible with this pack and can cause empty responses.
 # Tool definitions themselves are injected by the bridge (see
 # _tool_system_block in strata_grpc_backend.py), merged into the first
 # system frame.
