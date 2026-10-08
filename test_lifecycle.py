@@ -71,6 +71,38 @@ class AbortContext:
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_generation_without_progress_restarts_process_before_hour_ceiling(self):
+        from unittest.mock import patch
+        b = backend()
+        b.engine._send = lambda line: b.engine.commands.append(line)
+        class RestartRequested(Exception):
+            pass
+        with patch.object(bridge, 'PROGRESS_STALL_S', .05), \
+             patch.object(bridge.os, '_exit', side_effect=RestartRequested) as restart:
+            with self.assertRaises(RestartRequested):
+                next(b._generate([1], 10, ''))
+        restart.assert_called_once_with(1)
+        self.assertEqual(len(b.engine.commands), 1)
+
+    def test_progress_events_keep_long_generation_alive(self):
+        from unittest.mock import patch
+        b = backend()
+        def send(line):
+            b.engine.commands.append(line)
+            def pump():
+                for done in (8192, 16384, 24576, 32768):
+                    threading.Event().wait(.035)
+                    b.engine.lines.put(f'PP {done} 32768 100 1000')
+                b.engine.lines.put('T 6')
+                b.engine.lines.put('DONE')
+            threading.Thread(target=pump, daemon=True).start()
+        b.engine._send = send
+        with patch.object(bridge, 'PROGRESS_STALL_S', .10), \
+             patch.object(bridge.os, '_exit') as restart:
+            output = list(b._generate([1], 10, ''))
+        self.assertEqual(output, [6])
+        restart.assert_not_called()
+
     def test_cancelled_vision_admission_removes_request_embeddings(self):
         import tempfile
         from pathlib import Path

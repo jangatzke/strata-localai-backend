@@ -50,6 +50,7 @@ IMAGE_PAD = "<|" + "image_pad" + "|>"
 
 READY_TIMEOUT_S = 1200   # engine load takes minutes (experts + PLE)
 GEN_TIMEOUT_S = 3600     # per-request hard ceiling
+PROGRESS_STALL_S = 180   # no PP/token progress after generation starts
 
 
 class ToolFormatError(RuntimeError):
@@ -1285,16 +1286,26 @@ class StrataBackend(pb_grpc.BackendServicer):
         print(f"[strata-backend] {command}: {len(ids)} prompt tokens, "
               f"max_new={max_new}{keys or ' (engine defaults)'}", flush=True)
         started = time.time()
+        last_progress = time.monotonic()
+        prefilled = -1
         n = 0
         while True:
             if check_active is not None:
                 check_active()
             if getattr(self, "stopping", False):
                 raise EngineError("backend is stopping")
+            idle = time.monotonic() - last_progress
+            if idle >= PROGRESS_STALL_S:
+                # A hung engine may ignore STOP/QUIT, leaving the serial permit
+                # occupied. Exit the whole unit; systemd kills its cgroup (engine
+                # included) and Restart=on-failure loads a fresh bridge.
+                print(f"[strata-backend] generation stalled: no PP/token progress "
+                      f"for {idle:.0f}s; exiting for systemd restart", flush=True)
+                os._exit(1)
             if time.time() - started > GEN_TIMEOUT_S:
                 raise EngineError("generation timed out")
             try:
-                line = self.engine.lines.get(timeout=1.0)
+                line = self.engine.lines.get(timeout=min(1.0, max(.01, PROGRESS_STALL_S - idle)))
             except queue.Empty:
                 if not self.engine.alive():
                     raise EngineError("the engine died mid-generation")
@@ -1302,6 +1313,7 @@ class StrataBackend(pb_grpc.BackendServicer):
             if line is None or (self.engine.ended and not self.engine.alive()):
                 raise EngineError("the engine died mid-generation")
             if line.startswith("T "):
+                last_progress = time.monotonic()
                 if n == 0:
                     print("[strata-engine-pp] DECODE_START", flush=True)
                 n += 1
@@ -1309,6 +1321,10 @@ class StrataBackend(pb_grpc.BackendServicer):
             elif line.startswith("PP ") or line.startswith("INFO "):
                 if line.startswith("PP "):
                     print(f"[strata-engine-pp] {line.strip()}", flush=True)
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) > prefilled:
+                        prefilled = int(parts[1])
+                        last_progress = time.monotonic()
                 continue
             elif line.startswith("ERR"):
                 raise EngineError(line.strip())
