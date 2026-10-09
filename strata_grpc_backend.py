@@ -281,24 +281,19 @@ class Engine:
             return
         deadline = time.time() + timeout_s
         n = 0
-        idle = 0
         drained_terminal = False
         while time.time() < deadline:
             if not self.alive():
                 break
             try:
                 line = source.get(timeout=min(1.0, max(0.001, deadline - time.time())))
-                idle = 0
             except queue.Empty:
-                # nothing pending for a moment; a few idle seconds mean the
-                # engine has nothing queued anymore (a missing DONE is fine)
-                idle += 1
-                if self.parallel == 1 and idle >= 3:
-                    break
+                # Silence during prefill is not an abort acknowledgement.
+                # Retain ownership until terminal output or the hard deadline.
                 continue
             if line is None:
                 break
-            if line.startswith(terminal) or line.startswith("ERR"):
+            if line.startswith(terminal) or (self.parallel == 2 and line.startswith("ERR")):
                 n += 1
                 drained_terminal = True
                 break
@@ -308,6 +303,11 @@ class Engine:
             print(f"[strata-backend] drain: discarded {n} leftover engine lines{scope}", flush=True)
         if self.parallel == 2 and self.alive() and not drained_terminal:
             raise EngineError(f"batch slot {slot} did not drain safely without BDONE")
+        if self.parallel == 1 and self.alive() and not drained_terminal:
+            # Delayed untagged output must never be handed to a new GEN owner.
+            # start() clears this quarantine only after spawning a fresh engine.
+            self.admission_broken = True
+            raise EngineError("serial generation did not drain safely without DONE; reload the engine")
 
     def batch_generate(self, max_new, keys, ids, embeddings=None, check_active=None):
         """Admit and serve one request on an isolated Strata batch slot."""
@@ -1280,6 +1280,8 @@ class StrataBackend(pb_grpc.BackendServicer):
             finally:
                 batch.close()
         command = "GENI" if embeddings else "GEN"
+        if getattr(self.engine, "admission_broken", False):
+            raise EngineError("serial admission is unreconciled; reload the engine")
         image_arg = f" {embeddings}" if embeddings else ""
         gen_line = f"{command} {max_new}{keys}{image_arg} {','.join(map(str, ids))}"
         self.engine._send(gen_line)
@@ -1669,7 +1671,8 @@ class StrataBackend(pb_grpc.BackendServicer):
                 # Cleanup belongs to this generation, never to an outer RPC.
                 if gen is not None:
                     gen.close()
-                    if not generation_complete and getattr(self.engine, "parallel", 1) == 1:
+                    if (not generation_complete and getattr(self.engine, "parallel", 1) == 1
+                            and not getattr(self.engine, "admission_broken", False)):
                         self.engine.stop()
                         self.engine.drain()
                 raise
