@@ -1,5 +1,6 @@
 """Real-lock bridge lifecycle regressions; fake engine, no GPU or tool execution."""
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import threading
 import queue
 import unittest
@@ -30,6 +31,10 @@ class FakeEngine:
         self.commands = []
         self.stops = 0
         self.drains = 0
+        self.applied = []
+
+    def apply_config(self, cfg):
+        self.applied.append(cfg)
 
     def alive(self):
         return self.loaded
@@ -562,6 +567,57 @@ class LifecycleTests(unittest.TestCase):
                 self.assertFalse(early_admission, 'B admitted before A cleanup finished')
                 replies = result if streaming else [result]
                 self.assertTrue(any(r.message == b'answer' for r in replies))
+
+
+class ConfigReload(unittest.TestCase):
+    """Config edits on disk must reach the next engine spawn without a bridge restart."""
+
+    def setUp(self):
+        import json, tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.tmp.name) / 'cfg.json')
+        self.cfg = {'model_name': 'test', 'args': ['--old']}
+        Path(self.path).write_text(json.dumps(self.cfg))
+        b = bridge.StrataBackend(dict(self.cfg), Tokenizer(), config_path=self.path)
+        b.engine = FakeEngine()
+        b.stop_ids = set()
+        b.think_close_ids = {5}
+        b.think_open_ids = set()
+        self.b = b
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_cfg(self, cfg):
+        import json
+        Path(self.path).write_text(json.dumps(cfg))
+
+    def test_load_applies_changed_file(self):
+        import json
+        self.write_cfg({'model_name': 'test', 'args': ['--new']})
+        self.b.engine.loaded = False
+        self.b.load()
+        self.assertEqual(self.b.cfg['args'], ['--new'])
+        self.assertEqual(self.b.engine.applied[-1]['args'], ['--new'])
+        self.assertEqual(self.b.engine.started, 1)
+
+    def test_unchanged_file_is_noop(self):
+        self.assertFalse(self.b.reload_config())
+        self.assertEqual(self.b.cfg['args'], ['--old'])
+
+    def test_broken_file_keeps_previous_config(self):
+        Path(self.path).write_text('{ not json')
+        self.b.engine.loaded = False
+        self.b.load()  # must not raise; serving continues on the old config
+        self.assertEqual(self.b.cfg['args'], ['--old'])
+        self.assertEqual(self.b.engine.started, 1)
+
+    def test_parallel_change_requires_restart(self):
+        import json
+        with self.assertRaisesRegex(bridge.EngineError, 'bridge service restart'):
+            self.b.apply_config({'model_name': 'test', 'parallel': 2})
+        # a rejected apply must not have swapped the config
+        self.assertEqual(self.b.cfg['args'], ['--old'])
 
 
 if __name__ == '__main__':

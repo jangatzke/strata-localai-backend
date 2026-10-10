@@ -166,6 +166,20 @@ class Engine:
     def alive(self) -> bool:
         return self.proc is not None and not self.ended and self.proc.poll() is None
 
+    def apply_config(self, cfg: dict):
+        """Swap in a freshly read config for the next engine spawn.
+
+        Structural choices fixed at service start (parallel slots, locks)
+        are NOT re-read here; changing "parallel" still requires a bridge
+        restart, so reject that explicitly instead of serving half-applied
+        settings.
+        """
+        if int(cfg.get("parallel", 1)) != self.parallel:
+            raise EngineError(
+                'changing "parallel" requires a bridge service restart, not just an engine reload')
+        self.cfg = cfg
+        self.log_path = cfg.get("log")
+
     def start(self):
         """Spawn the engine and block (bounded) until READY."""
         if self.alive():
@@ -1094,18 +1108,47 @@ class Vision:
 
 
 class StrataBackend(pb_grpc.BackendServicer):
-    def __init__(self, cfg: dict, tok):
+    def __init__(self, cfg: dict, tok, config_path: str | None = None):
         self.cfg = cfg
         self.tok = tok
+        self.config_path = config_path
         self.engine = Engine(cfg)
+        self.vision = None
+        self.load_lock = threading.Lock()
+        self.free_lock = threading.Lock()
+        self.stopping = False
+        # derived fields (vision block, gen semaphore, stop/think ids) come
+        # from apply_config so a config reload rebuilds them consistently
+        self.apply_config(cfg)
+        self.log_follower = EngineLogFollower(
+            cfg.get("log"), cfg.get("forward_log_pattern", DEFAULT_LOG_PATTERN))
+
+    def apply_config(self, cfg: dict):
+        """Swap in a freshly read config and rebuild its derived fields.
+
+        Structural choices fixed at service start (engine slot queues,
+        locks) are NOT re-read here; changing "parallel" still requires a
+        bridge restart, so reject it explicitly instead of serving
+        half-applied settings. The log follower keeps the pattern chosen
+        at service start for the same reason.
+        """
+        if int(cfg.get("parallel", 1)) != self.engine.parallel:
+            raise EngineError(
+                'changing "parallel" requires a bridge service restart, not just an engine reload')
+        self.cfg = cfg
+        self.engine.apply_config(cfg)
+        # a stale vision encoder from the old config must not linger;
+        # load() starts the configured one (or none) with fresh settings
+        if self.vision is not None:
+            try:
+                self.vision.close()
+            except Exception:
+                pass
         self.vision = None
         self.vision_cfg = cfg.get("vision")
         # Legacy GEN stays serialized; explicit parallel=2 mirrors Strata's
         # two BGEN slots and admits at most two request transactions.
-        self.gen_lock = threading.Semaphore(getattr(self.engine, "parallel", 1))
-        self.load_lock = threading.Lock()
-        self.free_lock = threading.Lock()
-        self.stopping = False
+        self.gen_lock = threading.Semaphore(self.engine.parallel)
         # stop markers: ChatML frame tokens plus the engine's end-of-text token
         stop_text = cfg.get("stop_tokens") or [
             IM_END, IM_START,
@@ -1113,14 +1156,29 @@ class StrataBackend(pb_grpc.BackendServicer):
         ]
         self.stop_ids = set()
         for s in stop_text:
-            self.stop_ids.update(tok.encode(s, parse_special=True))
+            self.stop_ids.update(self.tok.encode(s, parse_special=True))
         # the thinking close token: after it, a leading blank run precedes the
         # actual answer; we suppress those newlines once (the reasoning itself
         # is not touched - LocalAI separates it on its side)
-        self.think_open_ids = set(tok.encode(chr(60) + "think" + chr(62), parse_special=True))
-        self.think_close_ids = set(tok.encode(chr(60) + chr(47) + "think" + chr(62), parse_special=True))
-        self.log_follower = EngineLogFollower(
-            cfg.get("log"), cfg.get("forward_log_pattern", DEFAULT_LOG_PATTERN))
+        self.think_open_ids = set(self.tok.encode(chr(60) + "think" + chr(62), parse_special=True))
+        self.think_close_ids = set(self.tok.encode(chr(60) + chr(47) + "think" + chr(62), parse_special=True))
+
+    def reload_config(self):
+        """Re-read the config file so a fresh engine spawn uses current settings.
+
+        Returns True when a file was re-read, False when no path is known
+        (embedded/test configs). A malformed or unreadable file raises:
+        serving keeps the previous config instead of failing half-loaded.
+        """
+        if not self.config_path:
+            return False
+        cfg = json.loads(Path(self.config_path).read_text(encoding="utf-8"))
+        if cfg == self.cfg:
+            return False
+        print("[strata-backend] config changed on disk; applying it for the next engine start",
+              flush=True)
+        self.apply_config(cfg)
+        return True
 
     # -- helpers -----------------------------------------------------------
 
@@ -1141,6 +1199,13 @@ class StrataBackend(pb_grpc.BackendServicer):
                 raise EngineError("backend is stopping")
             if self.engine.alive() and (not self.vision_cfg or self.vision and self.vision.alive()):
                 return "already loaded"
+            # pick up config edits made since the bridge process started;
+            # a broken file must not take down serving, keep the old cfg
+            try:
+                self.reload_config()
+            except Exception as exc:
+                print(f"[strata-backend] config reload failed, keeping the previous config: {exc}",
+                      flush=True)
             print(f"[strata-backend] LoadModel: starting the engine for {self.cfg['model_name']}", flush=True)
             t0 = time.time()
             try:
@@ -1773,7 +1838,7 @@ def main():
 
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
     tok = build_tokenizer(cfg)
-    backend = StrataBackend(cfg, tok)
+    backend = StrataBackend(cfg, tok, config_path=a.config)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
 
