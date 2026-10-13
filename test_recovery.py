@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import re
+import threading
 import time
 import unittest
 import uuid
@@ -221,6 +222,154 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(text, answer)
         self.assertEqual(len(p.prompts), 1)
+    def test_tool_enabled_plain_text_streams_before_generation_finishes_when_opted_in(self):
+        p = Probe(['A visible answer.'], size=1)
+        p.cfg = {'stream_tool_text': True}
+        complete = []
+        original = p._generate
+        def observed(*args):
+            try:
+                yield from original(*args)
+            finally:
+                complete.append(True)
+        p._generate = observed
+        stream = p.PredictStream(options(), Context())
+        try:
+            first = next(stream)
+            self.assertFalse(complete, 'the first delta must precede the engine finish')
+            self.assertEqual(flatten([first])[1], 'A')
+            self.assertEqual(flatten([first])[0], [])
+            calls, rest = flatten(list(stream))
+            self.assertEqual(calls, [])
+            self.assertEqual('A' + rest, 'A visible answer.')
+        finally:
+            stream.close()
+
+    def test_progressive_tool_call_is_held_until_turn_validation(self):
+        p = Probe(['Intro. ' + VALID], size=1)
+        p.cfg = {'stream_tool_text': True}
+        complete = []
+        original = p._generate
+        def observed(*args):
+            try:
+                yield from original(*args)
+            finally:
+                complete.append(True)
+        p._generate = observed
+        seen = []
+        for reply in p.PredictStream(options(), Context()):
+            seen.append(reply)
+            if flatten([reply])[0]:
+                self.assertTrue(complete, 'never publish an unvalidated tool call')
+        calls, text = flatten(seen)
+        self.assertEqual(text, 'Intro. ')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0].arguments), {'command': 'pwd'})
+        self.assertEqual(b''.join(r.message for r in seen), b'',
+                         'raw markup must not leak through LocalAI')
+
+    def test_progressive_invalid_tool_retries_before_any_public_delta(self):
+        p = Probe([INVALID, VALID], size=1)
+        p.cfg = {'stream_tool_text': True}
+        replies = list(p.PredictStream(options(), Context()))
+        calls, text = flatten(replies)
+        self.assertEqual(len(p.prompts), 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(text, '')
+        self.assertEqual(b''.join(r.message for r in replies), b'')
+
+    def test_progressive_visible_preamble_then_invalid_tool_fails_without_retry(self):
+        for size in (1, 7, 4096):
+            with self.subTest(size=size):
+                p = Probe(['Visible preamble.\n' + INVALID, VALID], size=size)
+                p.cfg = {'stream_tool_text': True}
+                ctx = Context()
+                seen = []
+                with self.assertRaises(RpcAborted):
+                    for reply in p.PredictStream(options(), ctx):
+                        seen.append(reply)
+                calls, text = flatten(seen)
+                self.assertIn('Visible preamble.', text)
+                self.assertEqual(calls, [])
+                self.assertEqual(len(p.prompts), 1, 'never replay an exposed turn')
+                self.assertEqual(b''.join(r.message for r in seen), b'')
+                self.assertNotIn('PRIVATE-PARTIAL', text + ctx.details)
+
+    def test_progressive_empty_reply_does_not_prevent_private_retry(self):
+        p = Probe(['STOP\n' + INVALID, VALID], size=4096)
+        p.cfg = {'stream_tool_text': True}
+        opts = options()
+        opts.StopPrompts = ['STOP']
+        replies = list(p.PredictStream(opts, Context()))
+        calls, text = flatten(replies)
+        self.assertEqual(len(p.prompts), 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(text, '')
+
+    def test_progressive_orphan_closer_and_partial_opener_never_leak(self):
+        for bad in ('</tool_call>', '<tool_cal'):
+            for size in (1, 7, 4096):
+                with self.subTest(bad=bad, size=size):
+                    p = Probe([bad, VALID], size=size)
+                    p.cfg = {'stream_tool_text': True}
+                    seen = list(p.PredictStream(options(), Context()))
+                    calls, text = flatten(seen)
+                    self.assertEqual(len(p.prompts), 2)
+                    self.assertEqual(text, '')
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(b''.join(r.message for r in seen), b'')
+
+    def test_progressive_valid_call_followed_by_stray_closer_is_never_published(self):
+        for size in (1, 7, 4096):
+            with self.subTest(size=size):
+                p = Probe([VALID + '</tool_call>', VALID], size=size)
+                p.cfg = {'stream_tool_text': True}
+                seen = list(p.PredictStream(options(), Context()))
+                calls, text = flatten(seen)
+                self.assertEqual(len(p.prompts), 2)
+                self.assertEqual(text, '')
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(json.loads(calls[0].arguments), {'command': 'pwd'})
+
+    def test_progressive_native_call_stays_deferred_and_stray_suffix_retries(self):
+        native = ('<tool_call><function=terminal><parameter=command>pwd'
+                  '</parameter></function></tool_call>')
+        for size in (1, 7, 4096):
+            with self.subTest(size=size):
+                p = Probe([native + ' unexpected', native], size=size)
+                p.cfg = {'stream_tool_text': True, 'tool_call_format': 'native_xml'}
+                replies = list(p.PredictStream(options(), Context()))
+                calls, content = flatten(replies)
+                self.assertEqual(len(p.prompts), 2)
+                self.assertEqual(content, '')
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(json.loads(calls[0].arguments), {'command': 'pwd'})
+                self.assertEqual(b''.join(r.message for r in replies), b'')
+
+    def test_progressive_close_releases_inner_generation_with_retained_reference(self):
+        p = Probe(['Streaming answer.'], size=1)
+        p.cfg = {'stream_tool_text': True}
+        p.gen_lock = threading.Semaphore(1)
+        retained = []
+        original = p._stream
+        def capture(*args, **kwargs):
+            inner = original(*args, **kwargs)
+            if kwargs.get('_transaction'):
+                retained.append(inner)
+            return inner
+        p._stream = capture
+        stream = p.PredictStream(options(), Context())
+        try:
+            self.assertEqual(flatten([next(stream)])[1], 'S')
+            stream.close()
+            self.assertTrue(p.gen_lock.acquire(blocking=False),
+                            'closing the client stream must release generation ownership')
+            p.gen_lock.release()
+        finally:
+            stream.close()
+            for inner in retained:
+                inner.close()
+
     def test_no_tools_preserves_normal_streaming(self):
         p = Probe(['Normal answer'])
         calls, text = flatten(list(p.PredictStream(options('[]'), Context())))

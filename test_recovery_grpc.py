@@ -23,10 +23,16 @@ for name, streaming, responses, should_error in (
     ('native_predict_collision_recovery', False, [collision, fixture.VALID], False),
     ('native_stream_collision_exhaustion', True, [collision] * 3, True),
     ('native_predict_collision_exhaustion', False, [collision] * 3, True),
+    ('progressive_text_before_tool', True, ['An explanation. ' + fixture.VALID], False),
+    ('progressive_empty_retry', True, ['STOP\n' + fixture.INVALID, fixture.VALID], False),
+    ('progressive_orphan_retry', True, ['</tool_call>', fixture.VALID], False),
+    ('progressive_bad_neighbor_exhaustion', True, [fixture.VALID + '</tool_call>'] * 3, True),
 ):
     backend = Backend(responses, size=7)
     if name.startswith('native_'):
         backend.cfg = {'tool_call_format': 'native_xml'}
+    if name.startswith('progressive_'):
+        backend.cfg = {'stream_tool_text': True}
     server = grpc.server(ThreadPoolExecutor(max_workers=2))
     rpc.add_BackendServicer_to_server(backend, server)
     port = server.add_insecure_port('127.0.0.1:0')
@@ -37,6 +43,8 @@ for name, streaming, responses, should_error in (
         with grpc.insecure_channel(f'127.0.0.1:{port}') as channel:
             stub = rpc.BackendStub(channel)
             opts = pb.PredictOptions(Prompt='Synthetic regression', Tools=fixture.TOOLS, Tokens=500)
+            if name == 'progressive_empty_retry':
+                opts.StopPrompts.append('STOP\n')
             try:
                 if streaming:
                     replies = list(stub.PredictStream(opts, timeout=10))
@@ -51,7 +59,13 @@ for name, streaming, responses, should_error in (
                 calls = [t for reply in replies for d in reply.chat_deltas for t in d.tool_calls]
                 assert len(calls) == 1 and calls[0].name == 'terminal', name
                 assert json.loads(calls[0].arguments) == {'command': 'pwd'}, name
-                assert not any(d.content for reply in replies for d in reply.chat_deltas), name
+                content = ''.join(d.content for reply in replies for d in reply.chat_deltas)
+                assert content == ('An explanation. ' if name == 'progressive_text_before_tool' else ''), (name, content)
+                assert all(not reply.message for reply in replies), name
+                if name == 'progressive_text_before_tool':
+                    text_idx = next(i for i, r in enumerate(replies) if any(d.content for d in r.chat_deltas))
+                    tool_idx = next(i for i, r in enumerate(replies) if any(d.tool_calls for d in r.chat_deltas))
+                    assert text_idx < tool_idx, name
             assert len(backend.prompts) <= 3
             record = {'fixture': name, 'passed': True, 'attempts': len(backend.prompts),
                       'grpc_status': status.name if status else 'OK'}
@@ -59,5 +73,5 @@ for name, streaming, responses, should_error in (
             print(json.dumps(record), flush=True)
     finally:
         server.stop(0).wait()
-assert len(results) == 10
-print('PASS: ten real gRPC fixtures; no generated tool was executed.')
+assert len(results) == 14
+print('PASS: fourteen real gRPC fixtures; no generated tool was executed.')

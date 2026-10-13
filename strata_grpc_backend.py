@@ -632,8 +632,10 @@ class ToolCallStreamParser:
     could be the start of the opening tag are held back until decided.
     """
 
-    def __init__(self, tool_specs=None, tool_required=None, tool_dialect='json'):
+    def __init__(self, tool_specs=None, tool_required=None, tool_dialect='json',
+                 strict_markup=False):
         self.tool_dialect = tool_dialect
+        self.strict_markup = strict_markup
         self.any_xml_call = False
         self.mode = "text"
         self.buf = ""
@@ -733,6 +735,14 @@ class ToolCallStreamParser:
         while True:
             if self.mode == "text":
                 idx = self.buf.find(self.t_open)
+                if self.strict_markup:
+                    orphan = self.buf.find(self.t_close)
+                    if orphan >= 0 and (idx < 0 or orphan < idx):
+                        if orphan:
+                            out.append(("text", self.buf[:orphan]))
+                        self.buf = self.buf[orphan + len(self.t_close):]
+                        out.append(self._reject('', 'orphan-tool-delimiter'))
+                        continue
                 if idx >= 0:
                     if idx:
                         out.append(("text", self.buf[:idx]))
@@ -746,6 +756,8 @@ class ToolCallStreamParser:
                     self.xml_state = 'start'
                     continue
                 keep = self._prefix_suffix_len(self.buf, self.t_open)
+                if self.strict_markup:
+                    keep = max(keep, self._prefix_suffix_len(self.buf, self.t_close))
                 if keep < len(self.buf):
                     out.append(("text", self.buf[:len(self.buf) - keep]))
                     self.buf = self.buf[len(self.buf) - keep:]
@@ -960,7 +972,11 @@ class ToolCallStreamParser:
         if self.mode == "block":
             out.append(self._reject(self.block + self.buf, "incomplete-block"))
         elif self.buf:
-            out.append(("text", self.buf))
+            if (self.strict_markup and
+                    (self.t_open.startswith(self.buf) or self.t_close.startswith(self.buf))):
+                out.append(self._reject('', 'incomplete-tool-delimiter'))
+            else:
+                out.append(("text", self.buf))
         self.buf = ""
         self.block = ""
         self.mode = "text"
@@ -1417,6 +1433,7 @@ class StrataBackend(pb_grpc.BackendServicer):
         check_active()
         dialect = getattr(self, 'cfg', {}).get('tool_call_format', 'json')
         if streaming and not _transaction and _tool_system_block(o.Tools or "", dialect):
+            progressive = bool(getattr(self, 'cfg', {}).get('stream_tool_text', False))
             original = retry_prompt if retry_prompt is not None else o.Prompt
             reminder = (
                 "I did not produce a valid tool call." + IM_END + "\n" +
@@ -1430,13 +1447,30 @@ class StrataBackend(pb_grpc.BackendServicer):
             )
             for attempt in range(retry_count, 3):
                 check_active()
+                published = False
                 try:
-                    pending = list(self._stream(
+                    turn = self._stream(
                         o, streaming=True, retry_count=attempt,
                         retry_prompt=original if attempt == retry_count else original + reminder,
-                        _transaction=True, context=context))
+                        _transaction=True, context=context)
+                    if progressive:
+                        try:
+                            for reply in turn:
+                                visible = bool(reply.message) or any(
+                                    getattr(d, 'content', '') or getattr(d, 'reasoning_content', '')
+                                    or getattr(d, 'tool_calls', ()) for d in reply.chat_deltas)
+                                if not visible:
+                                    continue  # an empty stop-prompt delta published nothing
+                                published = True
+                                yield reply
+                        finally:
+                            turn.close()  # cancellation must release the inner generation lock
+                        return
+                    pending = list(turn)
                 except ToolFormatError:
-                    if attempt == 2:
+                    # A visible partial turn cannot be erased or replayed.
+                    # Pure tool turns still retry privately as before.
+                    if published or attempt == 2:
                         raise
                     print(f"[strata-backend] regenerating rejected turn ({attempt + 1}/2)",
                           flush=True)
@@ -1505,7 +1539,10 @@ class StrataBackend(pb_grpc.BackendServicer):
                     tool_required[fn['name']] = set((fn.get('parameters') or {}).get('required', []))
         except (ValueError, TypeError, AttributeError):
             pass
-        tool_parser = ToolCallStreamParser(tool_specs, tool_required, dialect)
+        progressive = streaming and _transaction and bool(getattr(self, 'cfg', {}).get('stream_tool_text', False))
+        tool_parser = ToolCallStreamParser(tool_specs, tool_required, dialect,
+                                           strict_markup=progressive)
+        deferred_tools = []
         finished = {"tokens": 0, "elapsed": 0.0}
         tok_idx = 0
 
@@ -1537,15 +1574,20 @@ class StrataBackend(pb_grpc.BackendServicer):
                     continue
                 if ev[0] == "tool":
                     tc_index += 1
-                    tools.append(pb.ToolCallDelta(index=tc_index - 1,
-                                                  id=str(uuid.uuid4()),
-                                                  name=ev[1], arguments=ev[2]))
+                    call = pb.ToolCallDelta(index=tc_index - 1,
+                                            id=str(uuid.uuid4()),
+                                            name=ev[1], arguments=ev[2])
+                    if progressive:
+                        deferred_tools.append(call)
+                    else:
+                        tools.append(call)
                     continue
-                if tc_index and ev[1].strip():
-                    # Native/XML contracts forbid ambiguous value remainders.
-                    # Mark before quarantine; the final transaction validates.
-                    ambiguous_tool_suffix = True
-                    if dialect == 'native_xml':
+                if tc_index:
+                    if ev[1].strip():
+                        # Text after a provisional call might be tool syntax;
+                        # never stream it before the whole turn is validated.
+                        ambiguous_tool_suffix = True
+                    if progressive or (dialect == 'native_xml' and ambiguous_tool_suffix):
                         continue
                 if invalid_seen:
                     # Text following a malformed envelope may be argument
@@ -1590,9 +1632,9 @@ class StrataBackend(pb_grpc.BackendServicer):
             n += 1
             msg = raw[raw_sent:]
             raw_sent = len(raw)
-            if streaming and (tools or rejected_tool):
-                # ChatDeltas carry the structured call or safe rejection.
-                # Never give LocalAI raw markup to leak as chat content.
+            if progressive or (streaming and (tools or rejected_tool)):
+                # Progressive tool turns must never leak raw tag fragments via
+                # LocalAI's fallback message field, even between parsed deltas.
                 msg = ""
             rejected_tool = False
             return pb.Reply(message=msg.encode("utf-8"), tokens=n,
@@ -1717,9 +1759,11 @@ class StrataBackend(pb_grpc.BackendServicer):
                 cd_content += ct_part
                 if cd_reason[rs_sent:] or cd_content[ct_sent:] or tools:
                     yield make_reply(cd_reason[rs_sent:], cd_content[ct_sent:], tools)
-                if ambiguous_tool_suffix and (dialect == 'native_xml' or tool_parser.any_xml_call):
-                    print('[strata-backend] failed tool turn: ambiguous native suffix; no calls published', flush=True)
-                    raise ToolFormatError('Ambiguous native tool turn; no calls published')
+                if ambiguous_tool_suffix and (progressive or dialect == 'native_xml' or tool_parser.any_xml_call):
+                    print('[strata-backend] failed tool turn: ambiguous suffix; no calls published', flush=True)
+                    raise ToolFormatError('Ambiguous tool turn; no calls published')
+                if progressive and invalid_seen:
+                    raise ToolFormatError('Invalid tool neighbor; no calls published')
                 rejection_echo = cd_content.strip() == (
                     "Tool call rejected: invalid format. Retry with an offered tool.")
                 if streaming and tc_index == 0 and tool_specs and (
@@ -1731,6 +1775,10 @@ class StrataBackend(pb_grpc.BackendServicer):
                           f'post_think={post_think} '
                           f'tool_marker_in_reason={"<tool_call>" in cd_reason}', flush=True)
                     raise ToolFormatError("Invalid, empty or incomplete tool turn; no calls published")
+                if deferred_tools:
+                    # The whole turn has passed suffix/rejection validation.
+                    # No executable call was published while it could change.
+                    yield make_reply('', '', deferred_tools)
 
             except BaseException:
                 # Cleanup belongs to this generation, never to an outer RPC.
