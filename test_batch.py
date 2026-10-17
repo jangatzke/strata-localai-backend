@@ -230,8 +230,43 @@ class BatchProtocolTests(unittest.TestCase):
         self.assertEqual(engine.command_args(explicit_batch), explicit_batch)
         self.assertEqual(engine.command_args(explicit_slots), explicit_slots)
         self.assertEqual(engine.command_args(explicit_equals), explicit_equals)
-        with self.assertRaisesRegex(ValueError, "parallel must be 1 or 2"):
-            Engine({"parallel": 3})
+        with self.assertRaisesRegex(ValueError, "parallel must be between 1 and 3"):
+            Engine({"parallel": 4})
+
+    def test_three_slots_route_interleaved_tokens_to_their_owners(self):
+        engine = Engine({'parallel': 3})
+        self.assertEqual(engine.command_args(['strata', '--serve']),
+                         ['strata', '--serve', '--batch', '3'])
+        engine.info['batch_slots'] = 3
+        engine.validate_batch_slots()
+        engine.proc = FakeProc()
+        engine.ended = False
+        admitted = []
+        assignments = {}
+        commands = []
+        guard = threading.Lock()
+        def send(line):
+            with guard:
+                commands.append(line)
+                slot = int(line.split()[1])
+                assignments[int(line.split()[-1])] = slot
+                admitted.append(slot)
+                engine._route_line('T 999\n')
+                engine._route_line('DONE\n')
+                engine._route_line(f'BADM {slot} 1\n')
+                if len(admitted) == 3:
+                    for slot_id in reversed(admitted):
+                        engine._route_line(f'BT {slot_id} {100 + slot_id}\n')
+                    for slot_id in admitted:
+                        engine._route_line(f'BDONE {slot_id} 2 stop 4.25\n')
+        engine._send = send
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(lambda token: list(engine.batch_generate(8, '', [token])), (11, 22, 33)))
+        self.assertEqual(len(admitted), 3)
+        self.assertEqual(set(admitted), {0, 1, 2})
+        self.assertEqual(results, [[999, 100 + assignments[token]] for token in (11, 22, 33)])
+        self.assertEqual(engine.available_slots(), 3)
+        self.assertEqual(len([c for c in commands if c.startswith('BGEN ')]), 3)
 
     def test_two_sessions_route_interleaved_tokens_to_their_own_slots(self):
         harness = ProtocolHarness()

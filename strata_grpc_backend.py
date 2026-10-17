@@ -6,8 +6,8 @@ Implements LocalAI's backend.Backend proto. Model loading / unloading:
   LoadModel -> spawns the Strata engine (`strata --serve ...`) with the args
               from the JSON config; waits for the engine's READY line.
   Predict / PredictStream -> tokenizes the prompt with the pack's tokenizer;
-              uses legacy GEN/T/DONE by default or two-slot BGEN/BT/BDONE when
-              the config explicitly sets parallel=2.
+              uses legacy GEN/T/DONE by default or N-slot BGEN/BT/BDONE when
+              the config explicitly sets parallel=N (2..3).
   Free     -> sends QUIT to the engine and waits for it to exit, releasing
               all GPU/RAM so LocalAI can load other models.
 
@@ -113,8 +113,8 @@ class Engine:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.parallel = int(cfg.get("parallel", 1))
-        if self.parallel not in (1, 2):
-            raise ValueError("parallel must be 1 or 2")
+        if not 1 <= self.parallel <= 3:
+            raise ValueError("parallel must be between 1 and 3")
         self.log_path = cfg.get("log")
         self.proc = None
         self.lines = queue.Queue()
@@ -137,19 +137,19 @@ class Engine:
         args = list(base)
         has_upstream_slots = any(arg in ("--batch", "--slots") or
                                  arg.startswith(("--batch=", "--slots=")) for arg in args)
-        if self.parallel == 2 and not has_upstream_slots:
-            args += ["--batch", "2"]
+        if self.parallel > 1 and not has_upstream_slots:
+            args += ["--batch", str(self.parallel)]
         return args
 
     def available_slots(self) -> int:
         return self.free_slots.qsize()
 
     def validate_batch_slots(self):
-        if self.parallel != 2:
+        if self.parallel <= 1:
             return
         reported = self.info.get("batch_slots")
-        if not isinstance(reported, int) or reported < 2:
-            raise EngineError(f"parallel=2 requires engine INFO batch_slots>=2; got batch_slots={reported}")
+        if not isinstance(reported, int) or reported < self.parallel:
+            raise EngineError(f"parallel={self.parallel} requires engine INFO batch_slots>={self.parallel}; got batch_slots={reported}")
 
     def _env(self) -> dict:
         env = dict(os.environ)
@@ -234,13 +234,13 @@ class Engine:
         if self.proc is proc:
             self.ended = True
         q.put(None)
-        if self.parallel == 2:
+        if self.parallel > 1:
             for target in self.slot_lines.values():
                 target.put(None)
 
     def _route_line(self, line: str):
         """Dispatch tagged batch output without letting requests steal tokens."""
-        if self.parallel == 2 and line.startswith(("BT ", "BDONE ")):
+        if self.parallel > 1 and line.startswith(("BT ", "BDONE ")):
             parts = line.split()
             try:
                 slot = int(parts[1])
@@ -267,7 +267,7 @@ class Engine:
         """Ask the engine to abort the current request mid-generation."""
         if self.alive() and self.can_stop:
             try:
-                if self.parallel == 2:
+                if self.parallel > 1:
                     if slot is not None:
                         self._send(f"BSTOP {slot}")
                 else:
@@ -283,7 +283,7 @@ class Engine:
         read the previous conversation's tokens (lost step), so every abort
         path drains until DONE (or a bounded timeout) before returning.
         """
-        if self.parallel == 2:
+        if self.parallel > 1:
             if slot is None:
                 return
             source = self.slot_lines[slot]
@@ -307,7 +307,7 @@ class Engine:
                 continue
             if line is None:
                 break
-            if line.startswith(terminal) or (self.parallel == 2 and line.startswith("ERR")):
+            if line.startswith(terminal) or (self.parallel > 1 and line.startswith("ERR")):
                 n += 1
                 drained_terminal = True
                 break
@@ -315,7 +315,7 @@ class Engine:
         if n:
             scope = f" for slot {slot}" if slot is not None else ""
             print(f"[strata-backend] drain: discarded {n} leftover engine lines{scope}", flush=True)
-        if self.parallel == 2 and self.alive() and not drained_terminal:
+        if self.parallel > 1 and self.alive() and not drained_terminal:
             raise EngineError(f"batch slot {slot} did not drain safely without BDONE")
         if self.parallel == 1 and self.alive() and not drained_terminal:
             # Delayed untagged output must never be handed to a new GEN owner.
@@ -325,8 +325,8 @@ class Engine:
 
     def batch_generate(self, max_new, keys, ids, embeddings=None, check_active=None):
         """Admit and serve one request on an isolated Strata batch slot."""
-        if self.parallel != 2:
-            raise EngineError("batch generation requires parallel=2")
+        if self.parallel <= 1:
+            raise EngineError("batch generation requires parallel>1")
         while True:
             if self.admission_broken:
                 raise EngineError("batch admission is unreconciled; reload the engine")
@@ -1162,8 +1162,8 @@ class StrataBackend(pb_grpc.BackendServicer):
                 pass
         self.vision = None
         self.vision_cfg = cfg.get("vision")
-        # Legacy GEN stays serialized; explicit parallel=2 mirrors Strata's
-        # two BGEN slots and admits at most two request transactions.
+        # Legacy GEN stays serialized; parallel>1 mirrors Strata's
+        # BGEN slots and admits up to the configured request count.
         self.gen_lock = threading.Semaphore(self.engine.parallel)
         # stop markers: ChatML frame tokens plus the engine's end-of-text token
         stop_text = cfg.get("stop_tokens") or [
@@ -1336,7 +1336,7 @@ class StrataBackend(pb_grpc.BackendServicer):
     def _generate(self, ids, max_new, keys, embeddings=None, check_active=None):
         """Run one legacy or batch request; yield token ids and return metadata."""
         self._ensure_loaded()
-        if getattr(self.engine, "parallel", 1) == 2:
+        if getattr(self.engine, "parallel", 1) > 1:
             command = "BGENI" if embeddings is not None else "BGEN"
             print(f"[strata-backend] {command}: {len(ids)} prompt tokens, "
                   f"max_new={max_new}{keys or ' (engine defaults)'}", flush=True)
