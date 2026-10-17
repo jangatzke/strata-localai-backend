@@ -7,7 +7,7 @@ Implements LocalAI's backend.Backend proto. Model loading / unloading:
               from the JSON config; waits for the engine's READY line.
   Predict / PredictStream -> tokenizes the prompt with the pack's tokenizer;
               uses legacy GEN/T/DONE by default or N-slot BGEN/BT/BDONE when
-              the config explicitly sets parallel=N (2..3).
+              the config explicitly sets parallel=N (2..8).
   Free     -> sends QUIT to the engine and waits for it to exit, releasing
               all GPU/RAM so LocalAI can load other models.
 
@@ -113,8 +113,8 @@ class Engine:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.parallel = int(cfg.get("parallel", 1))
-        if not 1 <= self.parallel <= 3:
-            raise ValueError("parallel must be between 1 and 3")
+        if not 1 <= self.parallel <= 8:
+            raise ValueError("parallel must be between 1 and 8")
         self.log_path = cfg.get("log")
         self.proc = None
         self.lines = queue.Queue()
@@ -1888,7 +1888,9 @@ def main():
     tok = build_tokenizer(cfg)
     backend = StrataBackend(cfg, tok, config_path=a.config)
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+    # Eight generation RPCs can occupy eight workers; leave room for
+    # Free/LoadModel and other management calls while those streams run.
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
 
     def shutdown(*_):
         backend.stopping = True

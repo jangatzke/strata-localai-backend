@@ -1,4 +1,4 @@
-"""Deterministic protocol tests for Strata's two-slot batch mode."""
+"""Deterministic protocol tests for Strata's batch slots (up to eight)."""
 import ast
 import queue
 import subprocess
@@ -220,18 +220,62 @@ class BatchProtocolTests(unittest.TestCase):
         self.assertEqual(engine.parallel, 1)
         self.assertEqual(engine.command_args(["strata", "--serve"]), ["strata", "--serve"])
 
-    def test_parallel_two_adds_batch_flag_only_without_upstream_batch_syntax(self):
-        engine = Engine({"parallel": 2})
+    def test_parallel_two_to_eight_add_batch_flag_without_overriding_engine_args(self):
         base = ["strata", "--serve"]
-        self.assertEqual(engine.command_args(base), base + ["--batch", "2"])
-        explicit_batch = base + ["--batch", "4"]
-        explicit_slots = base + ["--slots", "4"]
-        explicit_equals = base + ["--batch=4"]
-        self.assertEqual(engine.command_args(explicit_batch), explicit_batch)
-        self.assertEqual(engine.command_args(explicit_slots), explicit_slots)
-        self.assertEqual(engine.command_args(explicit_equals), explicit_equals)
-        with self.assertRaisesRegex(ValueError, "parallel must be between 1 and 3"):
-            Engine({"parallel": 4})
+        for count in range(2, 9):
+            with self.subTest(parallel=count):
+                engine = Engine({"parallel": count})
+                self.assertEqual(engine.command_args(base), base + ["--batch", str(count)])
+                self.assertEqual(engine.available_slots(), count)
+                self.assertEqual(set(engine.slot_lines), set(range(count)))
+                for explicit in (["--batch", str(count)], ["--slots", str(count)],
+                                 [f"--batch={count}"], [f"--slots={count}"]):
+                    self.assertEqual(engine.command_args(base + explicit), base + explicit)
+        for count in (0, 9):
+            with self.assertRaisesRegex(ValueError, "parallel must be between 1 and 8"):
+                Engine({"parallel": count})
+
+    def test_eight_slots_route_interleaved_output_and_reuse_each_slot(self):
+        engine = Engine({'parallel': 8})
+        engine.info['batch_slots'] = 8
+        engine.validate_batch_slots()
+        engine.proc = FakeProc()
+        engine.ended = False
+        assigned = {}
+        active = []
+        guard = threading.Lock()
+
+        def send(line):
+            with guard:
+                parts = line.split()
+                slot, marker = int(parts[1]), int(parts[-1])
+                assigned[marker] = slot
+                engine._route_line(f'BADM {slot} 1\n')
+                active.append(slot)
+                if len(active) == 8:
+                    for slot_id in reversed(active):
+                        engine._route_line(f'BT {slot_id} {100 + slot_id}\n')
+                        engine._route_line(f'BDONE {slot_id} 1 stop 1\n')
+                    active.clear()
+        engine._send = send
+        for start in (11, 21):
+            markers = list(range(start, start + 8))
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(lambda marker: list(engine.batch_generate(8, '', [marker])), markers))
+            self.assertEqual(set(assigned[m] for m in markers), set(range(8)))
+            self.assertEqual(results, [[100 + assigned[m]] for m in markers])
+            self.assertEqual(engine.available_slots(), 8)
+
+    def test_requested_slot_count_must_fit_engine_report(self):
+        for count in range(2, 9):
+            with self.subTest(parallel=count):
+                engine = Engine({'parallel': count})
+                for actual in (None, count - 1):
+                    engine.info['batch_slots'] = actual
+                    with self.assertRaisesRegex(EngineError, f'parallel={count}.*batch_slots={actual}'):
+                        engine.validate_batch_slots()
+                engine.info['batch_slots'] = count
+                engine.validate_batch_slots()
 
     def test_three_slots_route_interleaved_tokens_to_their_owners(self):
         engine = Engine({'parallel': 3})

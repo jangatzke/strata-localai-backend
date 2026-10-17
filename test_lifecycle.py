@@ -512,6 +512,18 @@ class LifecycleTests(unittest.TestCase):
         b.gen_lock.release()
         b.gen_lock.release()
 
+    def test_free_collects_all_eight_slot_permits(self):
+        b = backend()
+        b.engine.parallel = 8
+        b.gen_lock = threading.Semaphore(8)
+        self.assertTrue(b.free(timeout_s=.5))
+        self.assertFalse(getattr(b.engine, 'loaded', True))
+        for _ in range(8):
+            self.assertTrue(b.gen_lock.acquire(timeout=.1))
+        self.assertFalse(b.gen_lock.acquire(blocking=False))
+        for _ in range(8):
+            b.gen_lock.release()
+
     def test_ordinary_free_allows_later_load(self):
         b = backend()
         b.free()
