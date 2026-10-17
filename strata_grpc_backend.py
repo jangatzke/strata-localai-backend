@@ -6,8 +6,9 @@ Implements LocalAI's backend.Backend proto. Model loading / unloading:
   LoadModel -> spawns the Strata engine (`strata --serve ...`) with the args
               from the JSON config; waits for the engine's READY line.
   Predict / PredictStream -> tokenizes the prompt with the pack's tokenizer;
-              uses legacy GEN/T/DONE by default or N-slot BGEN/BT/BDONE when
-              the config explicitly sets parallel=N (2..8).
+              uses legacy GEN/T/DONE by default; with parallel=N (2..8),
+              starts alone on GEN and promotes to N-slot BGEN/BT/BDONE
+              when another request arrives.
   Free     -> sends QUIT to the engine and waits for it to exit, releasing
               all GPU/RAM so LocalAI can load other models.
 
@@ -127,6 +128,10 @@ class Engine:
         self.send_lock = threading.Lock()
         self.admission_lock = threading.Lock()
         self.admission_broken = False
+        self.serial_error_terminal = False
+        self.adaptive_lock = threading.Lock()
+        self.adaptive_requests = 0
+        self.promote_solo = threading.Event()
         self.slot_lines = {slot: queue.Queue() for slot in range(self.parallel)}
         self.free_slots = queue.Queue()
         for slot in range(self.parallel):
@@ -147,6 +152,7 @@ class Engine:
     def validate_batch_slots(self):
         if self.parallel <= 1:
             return
+
         reported = self.info.get("batch_slots")
         if not isinstance(reported, int) or reported < self.parallel:
             raise EngineError(f"parallel={self.parallel} requires engine INFO batch_slots>={self.parallel}; got batch_slots={reported}")
@@ -196,6 +202,10 @@ class Engine:
             bufsize=1, env=self._env())
         self.lines = queue.Queue()
         self.admission_broken = False
+        self.serial_error_terminal = False
+        with self.adaptive_lock:
+            self.adaptive_requests = 0
+            self.promote_solo.clear()
         self.slot_lines = {slot: queue.Queue() for slot in range(self.parallel)}
         self.free_slots = queue.Queue()
         for slot in range(self.parallel):
@@ -263,11 +273,13 @@ class Engine:
             self.proc.stdin.write(line + "\n")
             self.proc.stdin.flush()
 
-    def stop(self, slot=None):
+    def stop(self, slot=None, solo=False):
         """Ask the engine to abort the current request mid-generation."""
         if self.alive() and self.can_stop:
             try:
-                if self.parallel > 1:
+                if solo:
+                    self._send("STOP")
+                elif self.parallel > 1:
                     if slot is not None:
                         self._send(f"BSTOP {slot}")
                 else:
@@ -275,15 +287,15 @@ class Engine:
             except Exception:
                 pass
 
-    def drain(self, timeout_s: float = 120.0, slot=None):
+    def drain(self, timeout_s: float = 120.0, slot=None, solo=False):
         """Discard leftovers of an aborted generation.
 
         After STOP the engine still emits its remaining `T` lines and the
-        final `DONE`. Leaving them in the queue would make the NEXT request
+        final `DONE` (or terminal `ERR`). Leaving them in the queue would make the NEXT request
         read the previous conversation's tokens (lost step), so every abort
-        path drains until DONE (or a bounded timeout) before returning.
+        path drains until the terminal line (or a bounded timeout) before returning.
         """
-        if self.parallel > 1:
+        if self.parallel > 1 and not solo:
             if slot is None:
                 return
             source = self.slot_lines[slot]
@@ -307,7 +319,9 @@ class Engine:
                 continue
             if line is None:
                 break
-            if line.startswith(terminal) or (self.parallel > 1 and line.startswith("ERR")):
+            # Strata ERR refuses the request and is itself terminal: no DONE
+            # follows. This also applies when STOP races with an error.
+            if line.startswith(terminal) or line.startswith("ERR"):
                 n += 1
                 drained_terminal = True
                 break
@@ -315,13 +329,111 @@ class Engine:
         if n:
             scope = f" for slot {slot}" if slot is not None else ""
             print(f"[strata-backend] drain: discarded {n} leftover engine lines{scope}", flush=True)
-        if self.parallel > 1 and self.alive() and not drained_terminal:
+        if self.parallel > 1 and not solo and self.alive() and not drained_terminal:
             raise EngineError(f"batch slot {slot} did not drain safely without BDONE")
-        if self.parallel == 1 and self.alive() and not drained_terminal:
+        if (self.parallel == 1 or solo) and self.alive() and not drained_terminal:
             # Delayed untagged output must never be handed to a new GEN owner.
             # start() clears this quarantine only after spawning a fresh engine.
             self.admission_broken = True
             raise EngineError("serial generation did not drain safely without DONE; reload the engine")
+
+    def adaptive_generate(self, max_new, keys, ids, embeddings=None, check_active=None):
+        """GEN when alone; STOP/DONE before resuming the prefix through BGEN.
+
+        The solo owner holds admission_lock across the entire untagged stream.
+        Contenders signal it to stop and cannot admit BGEN until its DONE.
+        """
+        with self.adaptive_lock:
+            self.adaptive_requests += 1
+            if self.adaptive_requests > 1:
+                self.promote_solo.set()
+            solo = (self.can_stop and self.adaptive_requests == 1
+                    and self.available_slots() == self.parallel)
+        try:
+            if not solo:
+                return (yield from self.batch_generate(max_new, keys, ids, embeddings, check_active))
+            while not self.admission_lock.acquire(timeout=0.1):
+                if check_active is not None:
+                    check_active()
+                if self.admission_broken:
+                    raise EngineError("batch admission is unreconciled; reload the engine")
+            sent = completed = stopped = False
+            finish = None
+            out = []
+            started = time.time()
+            try:
+                if self.admission_broken:
+                    raise EngineError("serial admission is unreconciled; reload the engine")
+                if check_active is not None:
+                    check_active()
+                # A contender may have appeared during lock acquisition.
+                if not self.promote_solo.is_set():
+                    command = "GENI" if embeddings is not None else "GEN"
+                    image_arg = f" {embeddings}" if embeddings is not None else ""
+                    self._send(f"{command} {max_new}{keys}{image_arg} {','.join(map(str, ids))}")
+                    sent = True
+                    last_progress = time.monotonic()
+                    prefilled = -1
+                    while True:
+                        if check_active is not None:
+                            check_active()
+                        if self.promote_solo.is_set() and not stopped:
+                            self.stop(solo=True)
+                            stopped = True
+                        idle = time.monotonic() - last_progress
+                        if idle >= PROGRESS_STALL_S:
+                            print("[strata-backend] adaptive GEN stalled; restarting", flush=True)
+                            os._exit(1)
+                        if time.time() - started > GEN_TIMEOUT_S:
+                            raise EngineError("generation timed out")
+                        try:
+                            line = self.lines.get(timeout=min(0.1, max(.01, PROGRESS_STALL_S - idle)))
+                        except queue.Empty:
+                            if not self.alive():
+                                raise EngineError("the engine died mid-generation")
+                            continue
+                        if line is None:
+                            raise EngineError("the engine died mid-generation")
+                        if line.startswith("T "):
+                            last_progress = time.monotonic()
+                            tid = int(line.split()[1])
+                            out.append(tid)
+                            yield tid
+                        elif line.startswith("PP "):
+                            print(f"[strata-engine-pp] {line.strip()}", flush=True)
+                            parts = line.split()
+                            if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) > prefilled:
+                                prefilled = int(parts[1])
+                                last_progress = time.monotonic()
+                        elif line.startswith("ERR"):
+                            completed = True  # ERR is terminal; no DONE follows.
+                            raise EngineError(line.strip())
+                        elif line.startswith("DONE"):
+                            parts = line.split()
+                            finish = parts[5] if len(parts) > 5 else None
+                            completed = True
+                            break
+            finally:
+                try:
+                    if sent and not completed and not self.admission_broken:
+                        if not stopped:
+                            self.stop(solo=True)
+                        self.drain(solo=True)
+                finally:
+                    self.admission_lock.release()
+
+            left = max_new - len(out)
+            if not sent or (stopped and left > 0 and finish not in ("stop", "length")):
+                # max_new is a total budget, not a budget per leg.
+                return (yield from self.batch_generate(
+                    left if sent else max_new, keys, list(ids) + out, embeddings, check_active))
+            return {"tokens": len(out), "elapsed": time.time() - started,
+                    "reason": "solo"}
+        finally:
+            with self.adaptive_lock:
+                self.adaptive_requests -= 1
+                if self.adaptive_requests == 0:
+                    self.promote_solo.clear()
 
     def batch_generate(self, max_new, keys, ids, embeddings=None, check_active=None):
         """Admit and serve one request on an isolated Strata batch slot."""
@@ -1334,15 +1446,15 @@ class StrataBackend(pb_grpc.BackendServicer):
         return keys
 
     def _generate(self, ids, max_new, keys, embeddings=None, check_active=None):
-        """Run one legacy or batch request; yield token ids and return metadata."""
+        """Run one legacy or adaptive request; yield IDs and return metadata."""
         self._ensure_loaded()
         if getattr(self.engine, "parallel", 1) > 1:
-            command = "BGENI" if embeddings is not None else "BGEN"
+            command = "adaptive GENI/BGENI" if embeddings is not None else "adaptive GEN/BGEN"
             print(f"[strata-backend] {command}: {len(ids)} prompt tokens, "
                   f"max_new={max_new}{keys or ' (engine defaults)'}", flush=True)
             started = time.time()
             n = 0
-            batch = self.engine.batch_generate(max_new, keys, ids, embeddings, check_active)
+            batch = self.engine.adaptive_generate(max_new, keys, ids, embeddings, check_active)
             try:
                 while True:
                     try:
@@ -1351,7 +1463,7 @@ class StrataBackend(pb_grpc.BackendServicer):
                         result = exc.value or {"tokens": n, "elapsed": time.time() - started}
                         elapsed = result.get("elapsed", time.time() - started)
                         if n > 0 and elapsed > 0:
-                            print(f"[strata-backend] BGEN done: {n} tokens in {elapsed:.1f}s "
+                            print(f"[strata-backend] adaptive generation done: {n} tokens in {elapsed:.1f}s "
                                   f"({n / elapsed:.1f} tok/s)", flush=True)
                         return result
                     if n == 0:
@@ -1365,6 +1477,7 @@ class StrataBackend(pb_grpc.BackendServicer):
             raise EngineError("serial admission is unreconciled; reload the engine")
         image_arg = f" {embeddings}" if embeddings else ""
         gen_line = f"{command} {max_new}{keys}{image_arg} {','.join(map(str, ids))}"
+        self.engine.serial_error_terminal = False
         self.engine._send(gen_line)
         print(f"[strata-backend] {command}: {len(ids)} prompt tokens, "
               f"max_new={max_new}{keys or ' (engine defaults)'}", flush=True)
@@ -1410,6 +1523,7 @@ class StrataBackend(pb_grpc.BackendServicer):
                         last_progress = time.monotonic()
                 continue
             elif line.startswith("ERR"):
+                self.engine.serial_error_terminal = True  # upstream ERR ends GEN without DONE
                 raise EngineError(line.strip())
             elif line.startswith("DONE"):
                 elapsed = time.time() - started
@@ -1655,7 +1769,31 @@ class StrataBackend(pb_grpc.BackendServicer):
                 return make_reply(rs_part, ct_part, tools)
             return None
 
-        with self.gen_lock:
+        class _Permit:
+            def __enter__(permit):
+                # Poll cancellation while queued; an abandoned RPC must not
+                # wait for a long generation just to discover it is inactive.
+                if context is None or not hasattr(self.gen_lock, 'acquire'):
+                    permit.legacy = True
+                    return self.gen_lock.__enter__()
+                permit.legacy = False
+                try:
+                    while True:
+                        check_active()
+                        if self.gen_lock.acquire(timeout=0.1):
+                            return None
+                except BaseException:
+                    # Admission never reached the generation body's finally.
+                    if embeddings is not None:
+                        embeddings.unlink(missing_ok=True)
+                    raise
+
+            def __exit__(permit, exc_type, exc_value, traceback):
+                if permit.legacy:
+                    return self.gen_lock.__exit__(exc_type, exc_value, traceback)
+                return self.gen_lock.__exit__(exc_type, exc_value, traceback)
+
+        with _Permit():
             gen = None
             generation_complete = False
             try:
@@ -1785,7 +1923,8 @@ class StrataBackend(pb_grpc.BackendServicer):
                 if gen is not None:
                     gen.close()
                     if (not generation_complete and getattr(self.engine, "parallel", 1) == 1
-                            and not getattr(self.engine, "admission_broken", False)):
+                            and not getattr(self.engine, "admission_broken", False)
+                            and not getattr(self.engine, "serial_error_terminal", False)):
                         self.engine.stop()
                         self.engine.drain()
                 raise

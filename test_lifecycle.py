@@ -76,6 +76,25 @@ class AbortContext:
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_predict_adaptive_lone_client_uses_gen(self):
+        b = backend()
+        b.engine = bridge.Engine({'parallel': 2})
+        b.engine.proc = type('Proc', (), {'poll': lambda self: None})()
+        b.engine.ended = False
+        b.engine.can_stop = True
+        b.gen_lock = threading.Semaphore(2)
+        commands = []
+        def send(command):
+            commands.append(command)
+            b.engine._route_line('T 5\n')
+            b.engine._route_line('T 6\n')
+            b.engine._route_line('DONE\n')
+        b.engine._send = send
+        result = b.Predict(pb.PredictOptions(Prompt='solo', Tokens=4), AbortContext())
+        self.assertEqual(result.message, b'answer')
+        self.assertEqual(commands, ['GEN 4 1'])
+        self.assertEqual(b.engine.available_slots(), 2)
+
     def test_generation_without_progress_restarts_process_before_hour_ceiling(self):
         from unittest.mock import patch
         b = backend()
@@ -263,6 +282,7 @@ class LifecycleTests(unittest.TestCase):
                 b.engine.proc = type('Proc', (), {'poll': lambda self: None})()
                 b.engine.ended = False
                 b.engine.can_stop = True
+                b.engine.adaptive_requests = 1  # an existing owner forces batch admission
                 b.gen_lock = threading.Semaphore(2)
                 sent = threading.Event()
                 stopped = threading.Event()
@@ -325,6 +345,7 @@ class LifecycleTests(unittest.TestCase):
         b.engine.proc = type('Proc', (), {'poll': lambda self: None})()
         b.engine.ended = False
         b.engine.can_stop = True
+        b.engine.adaptive_requests = 1  # an existing owner forces batch admission
         b.gen_lock = threading.Semaphore(2)
         first = threading.Event()
         second = threading.Event()
@@ -530,53 +551,28 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(b.load(), 'loaded')
         self.assertTrue(b.engine.loaded)
 
-    def test_failed_request_cleanup_cannot_steal_next_generation(self):
+    def test_terminal_err_does_not_drain_or_steal_next_generation(self):
         for streaming in (False, True):
             with self.subTest(streaming=streaming):
                 b = backend()
-                cleaning = threading.Event()
-                release_cleanup = threading.Event()
-                admitted_b = threading.Event()
-                owned = []
                 original_send = b.engine._send
                 def send(line):
                     if not b.engine.commands:
                         b.engine.commands.append(line)
                         b.engine.lines.put('ERR broken request A')
                     else:
-                        admitted_b.set()
                         original_send(line)
                 b.engine._send = send
-                original_drain = b.engine.drain
-                def drain():
-                    acquired = b.gen_lock.acquire(blocking=False)
-                    owned.append(not acquired)
-                    if acquired:
-                        b.gen_lock.release()
-                    cleaning.set()
-                    release_cleanup.wait(2)
-                    original_drain()
-                b.engine.drain = drain
                 opts = pb.PredictOptions(Prompt='test', Tokens=10)
                 def call():
                     if streaming:
                         return list(b.PredictStream(opts, AbortContext()))
                     return b.Predict(opts, AbortContext())
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    a = pool.submit(call)
-                    self.assertTrue(cleaning.wait(2))
-                    second = pool.submit(call)
-                    early_admission = admitted_b.wait(.1)
-                    release_cleanup.set()
-                    with self.assertRaisesRegex(RuntimeError, 'broken request A'):
-                        a.result(3)
-                    # Never wait on B after a broken ownership assertion: old code
-                    # loses DONE and would otherwise block for an hour.
-                    if early_admission:
-                        b.engine.lines.put('DONE')
-                    result = second.result(3)
-                self.assertEqual(owned, [True], 'cleanup must own the generation permit')
-                self.assertFalse(early_admission, 'B admitted before A cleanup finished')
+                with self.assertRaisesRegex(RuntimeError, 'broken request A'):
+                    call()
+                self.assertEqual(b.engine.stops, 0)
+                self.assertEqual(b.engine.drains, 0)
+                result = call()
                 replies = result if streaming else [result]
                 self.assertTrue(any(r.message == b'answer' for r in replies))
 

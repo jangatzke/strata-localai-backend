@@ -16,7 +16,7 @@ OpenAI-compatible client
 
 `LoadModel` starts the configured engine and waits for `READY`. `Predict` and `PredictStream` tokenize ChatML prompts and convert token IDs into structured content, reasoning and tool-call deltas. `Free` unloads the text/vision processes and releases resources; a later request can load them again. The separate Strata `server.py` is not required and must not hold the same model's resources while the bridge is serving it.
 
-The example defaults to **`parallel: 1`**, the serial `GEN`/`GENI` path. Set top-level `"parallel": N` (2–8) for N request slots using `BGEN`/`BGENI`, `BADM`, `BT`, `BDONE` and slot-scoped `BSTOP`. The bridge adds `--batch N` unless engine arguments already contain `--batch`/`--slots` syntax; explicit engine arguments are preserved. On startup it requires `INFO batch_slots` to be at least N: Strata can reduce the effective count when VRAM is insufficient, in which case the bridge fails closed rather than dispatching requests to nonexistent slots. Reduce N and restart the bridge if that happens. Values outside 1–8 are rejected. Two or more slots do not guarantee as many active decoders during every phase: admission/prefill is serialized, and the engine may finish an admission via its legacy compatibility path. Each slot consumes memory, and even an individual request can become slower at higher configured N; choose N based on Strata's reported capacity and measured workload. Changing N requires a bridge service restart, not only an engine reload.
+The example defaults to **`parallel: 1`**, the serial `GEN`/`GENI` path. Set top-level `"parallel": N` (2–8) to use `GEN`/`GENI` when alone with STOP/DONE promotion on contention, then N request slots using `BGEN`/`BGENI`, `BADM`, `BT`, `BDONE` and slot-scoped `BSTOP`. A promoted request resumes with its original prompt plus generated IDs and its remaining token budget. Once all active requests finish, the next lone request uses GEN again; a request already decoding in a batch slot does not migrate back to solo mid-stream. Engines without STOP capability retain the BGEN-only path. The bridge adds `--batch N` unless engine arguments already contain `--batch`/`--slots` syntax; explicit engine arguments are preserved. On startup it requires `INFO batch_slots` to be at least N: Strata can reduce the effective count when VRAM is insufficient, in which case the bridge fails closed rather than dispatching requests to nonexistent slots. Reduce N and restart the bridge if that happens. Values outside 1–8 are rejected. Two or more slots do not guarantee as many active decoders during every phase: admission/prefill is serialized, and the engine may finish an admission via its legacy compatibility path. Each slot consumes memory, and even an individual request can become slower at higher configured N; choose N based on Strata's reported capacity and measured workload. Changing N requires a bridge service restart, not only an engine reload.
 
 ## Files
 
@@ -69,7 +69,7 @@ Substitute another installed Python 3.10+ for `python3.14` if appropriate; this 
 
 Review every JSON path, especially `exe`, `cwd`, `strata_repo_tools`, tokenizer, pack/shards, MTP data, expert profile, control vector, vision projector, `lib_dirs` and tuning file. The supplied performance flags and experimental control vector are hardware/model-specific choices, not universal recommendations. Remove optional arguments together with all their values when their assets are unavailable. `gpu: 0` refers to the runtime device index, not a stable PCI identity.
 
-`run.sh` binds gRPC to `0.0.0.0:50053` by default (`PORT` overrides the port; `HOST` overrides the bind address). This gRPC listener has **no authentication or TLS**. Restrict access to LocalAI/trusted hosts with a firewall or private interface; never expose it publicly. `127.0.0.1` is reachable only from the same network namespace, so a container on another namespace needs a reachable host address.
+`run.sh` binds gRPC to `0.0.0.0:50053` by default (`PORT` overrides the port; `HOST` overrides the bind address). This gRPC listener has **no authentication or TLS**. Restrict access to LocalAI/trusted hosts with a firewall or private interface; never expose it publicly. `127.0.0.1` is reachable only from the same network namespace, so a container on another namespace needs a reachable host address. For a host-side bridge serving a Dockerized LocalAI, bind `HOST` to that Docker network's host gateway (for example, `172.18.0.1`) and set LocalAI's external backend mapping to the same gateway. Confirm the live gateway and network membership with `docker network inspect`, ensure the network exists before starting the bridge, and verify that the LAN address no longer accepts connections. Other containers on the same Docker network remain trusted peers; a gateway bind is network scoping, **not client authentication**.
 
 Configure LocalAI's `external_backends.json`, using the actual reachable address:
 
@@ -85,12 +85,13 @@ Generate the protobuf stubs and install requirements first. Run CPU regressions 
 
 ```bash
 ./venv/bin/python -m unittest -q \
-  test_parser test_recovery test_batch test_vision test_lifecycle
+  test_parser test_recovery test_batch test_vision test_lifecycle \
+  test_serial_ownership test_adaptive
 ./venv/bin/python test_recovery_grpc.py
 ./venv/bin/python -m py_compile strata_grpc_backend.py
 ```
 
-Run `test_recovery_grpc.py` as a separate process: it mutates fixture state and executes assertions directly. If using pytest, select the five CPU test files explicitly; unrestricted collection imports the live SSE probe and can contact LocalAI. pytest is optional and is not installed by `requirements.txt`.
+Run `test_recovery_grpc.py` as a separate process: it mutates fixture state and executes assertions directly. If using pytest, select the seven CPU test files explicitly; unrestricted collection imports the live SSE probe and can contact LocalAI. pytest is optional and is not installed by `requirements.txt`.
 
 With LocalAI and the bridge running, set the API URL and, for authenticated LocalAI, `LOCALAI_API_KEY` in your environment (do not put real keys in source or shell history):
 

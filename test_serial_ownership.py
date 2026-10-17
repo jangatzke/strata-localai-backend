@@ -102,6 +102,51 @@ class Context:
 
 class Repro(unittest.TestCase):
     def setUp(self): clock.now = 0.0
+    def test_err_is_terminal_without_stop_or_done_wait(self):
+        b = Backend()
+        original = b.engine._send
+        def send(command):
+            if command.startswith('GEN '):
+                b.engine.commands.append((clock.now, command))
+                b.engine.lines.put_at(clock.now, 'ERR refused')
+            else:
+                original(command)
+        b.engine._send = send
+        with self.assertRaisesRegex(ns['EngineError'], 'refused'):
+            list(b._stream(opts(1)))
+        self.assertEqual([c.split()[0] for _, c in b.engine.commands], ['GEN'])
+        self.assertEqual(clock.now, 0.0)
+        b.engine._send = original
+        self.assertEqual(b''.join(r.message for r in b._stream(opts(2))).decode(), 'answer-2')
+
+    def test_queued_cancel_does_not_wait_for_generation_permit(self):
+        b = Backend()
+        b.gen_lock.acquire()
+        entered = threading.Event()
+        inactive = threading.Event()
+        class WaitingContext:
+            def is_active(self):
+                entered.set()
+                return not inactive.is_set()
+        error = []
+        def run():
+            try:
+                list(b._stream(opts(2), context=WaitingContext()))
+            except Exception as exc:
+                error.append(exc)
+        thread = threading.Thread(target=run, daemon=True)
+        try:
+            thread.start()
+            self.assertTrue(entered.wait(1))
+            inactive.set()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(error), 1)
+            self.assertRegex(str(error[0]), 'cancelled')
+            self.assertEqual(b.engine.commands, [])
+        finally:
+            b.gen_lock.release()
+            thread.join(2)
     def test_serial_timeout_quarantines_engine_before_next_gen(self):
         b = Backend()
         with self.assertRaisesRegex(ns['EngineError'], 'drain'):
@@ -118,13 +163,12 @@ class Repro(unittest.TestCase):
         self.assertEqual(b.engine.commands, [])
         self.assertEqual(clock.now, 0, 'quarantined engine must not wait through another drain')
 
-    def test_serial_error_does_not_replace_terminal_acknowledgement(self):
+    def test_serial_error_is_terminal_acknowledgement(self):
         e = Engine()
         e.lines.put_at(0, 'ERR failed request')
-        e.lines.put_at(4, 'DONE')
         e.drain()
         self.assertEqual(e.lines.events, [])
-        self.assertEqual(clock.now, 4)
+        self.assertEqual(clock.now, 0)
 
     def test_serial_drain_waits_for_delayed_terminal(self):
         e = Engine()
