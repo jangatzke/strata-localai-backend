@@ -33,7 +33,7 @@ PB = SimpleNamespace(Reply=lambda **kw: SimpleNamespace(**kw),
                      ToolCallDelta=lambda **kw: SimpleNamespace(**kw))
 ns = dict(queue=queue, threading=threading, time=clock, codecs=codecs, json=json,
           re=re, uuid=uuid, Path=Path, pb=PB, os=SimpleNamespace(_exit=lambda code: None),
-          GEN_TIMEOUT_S=3600, PROGRESS_STALL_S=180,
+          GEN_TIMEOUT_S=3600, PROGRESS_STALL_S=180, DECODE_PROGRESS_S=1.0,
           IM_START='<|' + 'im_start' + '|>', IM_END='<|' + 'im_end' + '|>')
 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), 'exec'), ns)
 

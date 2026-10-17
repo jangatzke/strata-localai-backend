@@ -52,6 +52,7 @@ IMAGE_PAD = "<|" + "image_pad" + "|>"
 READY_TIMEOUT_S = 1200   # engine load takes minutes (experts + PLE)
 GEN_TIMEOUT_S = 3600     # per-request hard ceiling
 PROGRESS_STALL_S = 180   # no PP/token progress after generation starts
+DECODE_PROGRESS_S = 1.0  # throttle for live DECODE_PROGRESS lines (monitor counter)
 
 
 class ToolFormatError(RuntimeError):
@@ -361,6 +362,7 @@ class Engine:
             finish = None
             out = []
             started = time.time()
+            last_progress_line = 0.0
             try:
                 if self.admission_broken:
                     raise EngineError("serial admission is unreconciled; reload the engine")
@@ -398,6 +400,10 @@ class Engine:
                             last_progress = time.monotonic()
                             tid = int(line.split()[1])
                             out.append(tid)
+                            now_mono = time.monotonic()
+                            if len(out) <= 1 or now_mono - last_progress_line >= DECODE_PROGRESS_S:
+                                last_progress_line = now_mono
+                                print(f"[strata-engine-pp] DECODE_PROGRESS {len(out)} {max_new}", flush=True)
                             yield tid
                         elif line.startswith("PP "):
                             print(f"[strata-engine-pp] {line.strip()}", flush=True)
@@ -535,6 +541,7 @@ class Engine:
                         "reason": "serial-fallback"}
 
             n = 0
+            last_progress_line = 0.0
             # BGEN reads the prompt as a one-token legacy GEN admission. That
             # first T token is part of the response even when BADM continues
             # decoding in the selected batch slot.
@@ -556,6 +563,11 @@ class Engine:
                     raise EngineError("the engine died mid-generation")
                 if response.startswith("BT "):
                     n += 1
+                    now_line = time.time()
+                    if n <= 1 or now_line - last_progress_line >= DECODE_PROGRESS_S:
+                        last_progress_line = now_line
+                        print(f"[strata-engine-pp] DECODE_PROGRESS {n} {max_new} slot {slot}",
+                              flush=True)
                     yield int(response.split()[2])
                 elif response.startswith("BDONE "):
                     parts = response.split(maxsplit=5)
@@ -1483,6 +1495,7 @@ class StrataBackend(pb_grpc.BackendServicer):
               f"max_new={max_new}{keys or ' (engine defaults)'}", flush=True)
         started = time.time()
         last_progress = time.monotonic()
+        last_progress_line = 0.0
         prefilled = -1
         n = 0
         while True:
@@ -1513,6 +1526,10 @@ class StrataBackend(pb_grpc.BackendServicer):
                 if n == 0:
                     print("[strata-engine-pp] DECODE_START", flush=True)
                 n += 1
+                now_mono = time.monotonic()
+                if n <= 1 or now_mono - last_progress_line >= DECODE_PROGRESS_S:
+                    last_progress_line = now_mono
+                    print(f"[strata-engine-pp] DECODE_PROGRESS {n} {max_new}", flush=True)
                 yield int(line.split()[1])
             elif line.startswith("PP ") or line.startswith("INFO "):
                 if line.startswith("PP "):

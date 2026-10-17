@@ -22,6 +22,7 @@ NS = {
     "READY_TIMEOUT_S": 1,
     "GEN_TIMEOUT_S": 2,
     "PROGRESS_STALL_S": 180,
+    "DECODE_PROGRESS_S": 1.0,
 }
 exec(compile(ast.Module(body=NODES, type_ignores=[]), str(SOURCE), "exec"), NS)
 Engine = NS["Engine"]
