@@ -338,7 +338,8 @@ class Engine:
             self.admission_broken = True
             raise EngineError("serial generation did not drain safely without DONE; reload the engine")
 
-    def adaptive_generate(self, max_new, keys, ids, embeddings=None, check_active=None):
+    def adaptive_generate(self, max_new, keys, ids, embeddings=None, check_active=None,
+                         slot_ref=None):
         """GEN when alone; STOP/DONE before resuming the prefix through BGEN.
 
         The solo owner holds admission_lock across the entire untagged stream.
@@ -352,7 +353,8 @@ class Engine:
                     and self.available_slots() == self.parallel)
         try:
             if not solo:
-                return (yield from self.batch_generate(max_new, keys, ids, embeddings, check_active))
+                return (yield from self.batch_generate(max_new, keys, ids, embeddings,
+                                                       check_active, slot_ref))
             while not self.admission_lock.acquire(timeout=0.1):
                 if check_active is not None:
                     check_active()
@@ -432,7 +434,8 @@ class Engine:
             if not sent or (stopped and left > 0 and finish not in ("stop", "length")):
                 # max_new is a total budget, not a budget per leg.
                 return (yield from self.batch_generate(
-                    left if sent else max_new, keys, list(ids) + out, embeddings, check_active))
+                    left if sent else max_new, keys, list(ids) + out, embeddings,
+                    check_active, slot_ref))
             return {"tokens": len(out), "elapsed": time.time() - started,
                     "reason": "solo"}
         finally:
@@ -441,7 +444,8 @@ class Engine:
                 if self.adaptive_requests == 0:
                     self.promote_solo.clear()
 
-    def batch_generate(self, max_new, keys, ids, embeddings=None, check_active=None):
+    def batch_generate(self, max_new, keys, ids, embeddings=None, check_active=None,
+                      slot_ref=None):
         """Admit and serve one request on an isolated Strata batch slot."""
         if self.parallel <= 1:
             raise EngineError("batch generation requires parallel>1")
@@ -452,6 +456,10 @@ class Engine:
                 check_active()
             try:
                 slot = self.free_slots.get(timeout=0.1)
+                if slot_ref is not None:
+                    # Tell the request's _stream which engine slot it owns so
+                    # its stop-ID completion line can carry the slot tag.
+                    slot_ref["slot"] = slot
                 break
             except queue.Empty:
                 continue
@@ -524,9 +532,14 @@ class Engine:
                             raise EngineError(response.strip())
                         if response.startswith("T "):
                             admission_tokens.append(int(response.split()[1]))
+                        elif response.startswith("PP "):
+                            # PP belongs to serialized admission, so it is this
+                            # request's prefill; tag it so the monitor can show
+                            # per-slot prefill progress (batch path had none).
+                            print(f"[strata-engine-pp] {response.strip()} slot {slot}",
+                                  flush=True)
                         elif response.startswith("DONE"):
                             admission_done = True
-                        # PP and INFO also belong to serialized admission.
                 finally:
                     if pending:
                         # Fail closed: no new owner may consume delayed BADM.
@@ -1457,7 +1470,8 @@ class StrataBackend(pb_grpc.BackendServicer):
             keys += f" seed={int(o.Seed)}"
         return keys
 
-    def _generate(self, ids, max_new, keys, embeddings=None, check_active=None):
+    def _generate(self, ids, max_new, keys, embeddings=None, check_active=None,
+                 slot_ref=None):
         """Run one legacy or adaptive request; yield IDs and return metadata."""
         self._ensure_loaded()
         if getattr(self.engine, "parallel", 1) > 1:
@@ -1466,7 +1480,8 @@ class StrataBackend(pb_grpc.BackendServicer):
                   f"max_new={max_new}{keys or ' (engine defaults)'}", flush=True)
             started = time.time()
             n = 0
-            batch = self.engine.adaptive_generate(max_new, keys, ids, embeddings, check_active)
+            batch = self.engine.adaptive_generate(max_new, keys, ids, embeddings,
+                                                 check_active, slot_ref)
             try:
                 while True:
                     try:
@@ -1813,13 +1828,18 @@ class StrataBackend(pb_grpc.BackendServicer):
         with _Permit():
             gen = None
             generation_complete = False
+            # slot_ref is filled by batch_generate when this request wins an
+            # engine batch slot; _stream uses it to tag stop-ID completions.
+            slot_ref = {"slot": None}
             try:
                 check_active()
                 if context is not None and hasattr(context, "is_active"):
-                    gen = self._generate(ids, max_new, keys, embeddings, check_active)
+                    gen = self._generate(ids, max_new, keys, embeddings, check_active,
+                                         slot_ref)
                 else:
-                    gen = (self._generate(ids, max_new, keys, embeddings) if embeddings is not None
-                           else self._generate(ids, max_new, keys))
+                    gen = (self._generate(ids, max_new, keys, embeddings, None, slot_ref)
+                           if embeddings is not None
+                           else self._generate(ids, max_new, keys, None, None, slot_ref))
                 while True:
                     try:
                         check_active()
@@ -1845,8 +1865,12 @@ class StrataBackend(pb_grpc.BackendServicer):
                         started_text = False
                         continue
                     if tid in self.stop_ids:
-                        print(f"[strata-test] stop_ids hit at token {tok_idx}: tid={tid}",
-                              flush=True)
+                        # The slot tag lets the monitor attribute this exact
+                        # completion; untagged stays for the solo/serial path.
+                        slot_tag = (f" slot {slot_ref['slot']}"
+                                    if slot_ref.get("slot") is not None else "")
+                        print(f"[strata-test] stop_ids hit at token {tok_idx}: tid={tid}"
+                              f"{slot_tag}", flush=True)
                         if tok_idx == 0:
                             print("[strata-test] zero-token stop (prompt omitted)",
                                   flush=True)

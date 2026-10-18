@@ -235,7 +235,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                 pass
             def _sampling_keys(self, opts):
                 return ''
-            def _generate(self, ids, max_new, keys):
+            def _generate(self, ids, max_new, keys, *args):
                 self.response = self.responses.pop(0)
                 yield 1
                 yield 2
@@ -506,7 +506,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                 pass
             def _sampling_keys(self, opts):
                 return {}
-            def _generate(self, ids, max_new, keys):
+            def _generate(self, ids, max_new, keys, *args):
                 self.seen_max_new = max_new
                 yield 1
                 for tid in range(2, 2 + len(chunks)):
@@ -634,7 +634,7 @@ class ToolCallStreamParserTests(unittest.TestCase):
                 pass
             def _sampling_keys(self, opts):
                 return {}
-            def _generate(self, ids, max_new, keys):
+            def _generate(self, ids, max_new, keys, *args):
                 yield from range(len(tokens))
         tools = [{'type': 'function', 'function': {'name': 'update_todo_list',
                   'parameters': {'type': 'object', 'properties': {'todos': {'type': 'string'}}}}}]
