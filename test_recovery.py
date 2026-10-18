@@ -98,6 +98,111 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(text, '')
             self.assertNotIn('PRIVATE-PARTIAL', ''.join(p.prompts))
             self.assertNotIn('PRIVATE-PARTIAL', self.capture.getvalue())
+    def test_missing_required_parameter_guides_private_retry_without_leaking_values(self):
+        tools = json.dumps([{'type': 'function', 'function': {'name': 'read_file',
+            'parameters': {'type': 'object', 'properties': {
+                'path': {'type': 'string'}, 'indentation': {'type': 'object'}},
+                'required': ['path', 'indentation']}}}])
+        invalid = ('<tool_call><function=read_file><parameter=path>'
+                   'PRIVATE-PATH</parameter></function></tool_call>')
+        valid = ('<tool_call><function=read_file><parameter=path>'
+                 'PRIVATE-PATH</parameter><parameter=indentation>{}</parameter>'
+                 '</function></tool_call>')
+        p = Probe([invalid, valid], size=7)
+        p.cfg = {'tool_call_format': 'native_xml', 'stream_tool_text': True}
+        calls, content = flatten(list(p.PredictStream(options(tools), Context())))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(content, '')
+        self.assertEqual(json.loads(calls[0].arguments),
+                         {'path': 'PRIVATE-PATH', 'indentation': {}})
+        self.assertIn('read_file: missing required parameter indentation', p.prompts[1])
+        self.assertNotIn('PRIVATE-PATH', p.prompts[1])
+        self.assertNotIn('PRIVATE-PATH', self.capture.getvalue())
+
+    def test_missing_required_parameter_is_in_exhaustion_error_without_values(self):
+        tools = json.dumps([{'type': 'function', 'function': {'name': 'read_file',
+            'parameters': {'type': 'object', 'properties': {
+                'path': {'type': 'string'}, 'indentation': {'type': 'object'}},
+                'required': ['path', 'indentation']}}}])
+        invalid = ('<tool_call><function=read_file><parameter=path>'
+                   'PRIVATE-PATH</parameter></function></tool_call>')
+        p = Probe([invalid] * 3, size=13)
+        p.cfg = {'tool_call_format': 'native_xml', 'stream_tool_text': True}
+        ctx = Context()
+        published = []
+        with self.assertRaises(RpcAborted):
+            for reply in p.PredictStream(options(tools), ctx):
+                published.append(reply)
+        self.assertEqual(published, [])
+        self.assertEqual(len(p.prompts), 3)
+        self.assertIn('read_file: missing required parameter indentation', ctx.details)
+        self.assertNotIn('PRIVATE-PATH', ctx.details)
+
+    def test_wrong_type_is_explained_to_model_without_argument_value(self):
+        tools = json.dumps([{'type': 'function', 'function': {'name': 'read_file',
+            'parameters': {'type': 'object', 'properties': {'offset': {'type': 'integer'}},
+                           'required': ['offset']}}}])
+        invalid = ('<tool_call><function=read_file><parameter=offset>'
+                   '"PRIVATE-STRING"</parameter></function></tool_call>')
+        valid = ('<tool_call><function=read_file><parameter=offset>'
+                 '2</parameter></function></tool_call>')
+        p = Probe([invalid, valid])
+        p.cfg = {'tool_call_format': 'native_xml', 'stream_tool_text': True}
+        calls, _ = flatten(list(p.PredictStream(options(tools), Context())))
+        self.assertEqual(len(calls), 1)
+        self.assertIn('read_file: parameter offset must be integer', p.prompts[1])
+        self.assertNotIn('PRIVATE-STRING', p.prompts[1])
+
+    def test_unoffered_parameter_is_explained_without_leaking_its_name_or_value(self):
+        tools = json.dumps([{'type': 'function', 'function': {'name': 'read_file',
+            'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}},
+                           'required': ['path']}}}])
+        invalid = ('<tool_call><function=read_file><parameter=path>a</parameter>'
+                   '<parameter=PRIVATE_KEY>PRIVATE-VALUE</parameter></function></tool_call>')
+        valid = ('<tool_call><function=read_file><parameter=path>a</parameter>'
+                 '</function></tool_call>')
+        p = Probe([invalid, valid])
+        p.cfg = {'tool_call_format': 'native_xml', 'stream_tool_text': True}
+        calls, _ = flatten(list(p.PredictStream(options(tools), Context())))
+        self.assertEqual(len(calls), 1)
+        self.assertIn('read_file: unoffered parameter', p.prompts[1])
+        self.assertNotIn('PRIVATE_KEY', p.prompts[1])
+        self.assertNotIn('PRIVATE-VALUE', p.prompts[1])
+
+    def test_buffered_tool_turn_receives_the_same_specific_retry_hint(self):
+        tools = json.dumps([{'type': 'function', 'function': {'name': 'read_file',
+            'parameters': {'type': 'object', 'properties': {
+                'path': {'type': 'string'}, 'indentation': {'type': 'object'}},
+                'required': ['path', 'indentation']}}}])
+        invalid = ('<tool_call><function=read_file><parameter=path>'
+                   'PRIVATE-PATH</parameter></function></tool_call>')
+        valid = ('<tool_call><function=read_file><parameter=path>'
+                 'PRIVATE-PATH</parameter><parameter=indentation>{}</parameter>'
+                 '</function></tool_call>')
+        p = Probe([invalid, valid])
+        p.cfg = {'tool_call_format': 'native_xml', 'stream_tool_text': False}
+        calls, _ = flatten(list(p.PredictStream(options(tools), Context())))
+        self.assertEqual(len(calls), 1)
+        self.assertIn('read_file: missing required parameter indentation', p.prompts[1])
+        self.assertNotIn('PRIVATE-PATH', p.prompts[1])
+
+    def test_json_call_with_missing_required_field_gets_count_and_retry_hint(self):
+        tools = json.dumps([{'type': 'function', 'function': {'name': 'read_file',
+            'parameters': {'type': 'object', 'properties': {
+                'path': {'type': 'string'}, 'indentation': {'type': 'object'}},
+                'required': ['path', 'indentation']}}}])
+        invalid = ('<tool_call>{"name":"read_file","arguments":'
+                   '{"path":"PRIVATE-PATH"}}</tool_call>')
+        valid = ('<tool_call>{"name":"read_file","arguments":'
+                 '{"path":"PRIVATE-PATH","indentation":{}}}</tool_call>')
+        p = Probe([invalid, valid], size=11)
+        p.cfg = {'tool_call_format': 'json', 'stream_tool_text': True}
+        calls, _ = flatten(list(p.PredictStream(options(tools), Context())))
+        self.assertEqual(len(calls), 1)
+        self.assertIn('read_file: missing required parameter indentation', p.prompts[1])
+        self.assertIn('1 of 2 required parameters provided', p.prompts[1])
+        self.assertNotIn('PRIVATE-PATH', p.prompts[1])
+
     def test_echo_after_invalid_attempt_is_not_a_successful_final_answer(self):
         p = Probe([INVALID, ERROR, VALID])
         calls, text = flatten(list(p.PredictStream(options(), Context())))

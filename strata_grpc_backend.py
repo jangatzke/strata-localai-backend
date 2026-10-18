@@ -827,6 +827,7 @@ class ToolCallStreamParser:
         self.tool_required = (tool_required if tool_required is not None else
                               {name: set(props) for name, props in self.tool_specs.items()})
         self.last_rejection = ""
+        self.validation_hint = None
         self.t_open = chr(60) + "tool_call" + chr(62)
         # Qwen3 closes with the bracket-slash form, not an XML-style end tag
         self.t_close = chr(60) + "/" + "tool_call" + chr(62)
@@ -1017,7 +1018,9 @@ class ToolCallStreamParser:
                 json_shape = " json_error=other"
         self.last_rejection = (f"reason={reason} dialect={dialect} tool={offered} "
                                f"parameter_count={params} chars={len(block)} "
-                               f"function_closed={'</function>' in block}{json_shape}")
+                               f"function_closed={'</function>' in block}{json_shape}"
+                               + (f" validation={self.validation_hint}"
+                                  if self.validation_hint else ""))
         if self.reject_capture is not None:
             try:
                 self.reject_capture(block, reason, self.tool_specs, self.tool_required)
@@ -1065,9 +1068,24 @@ class ToolCallStreamParser:
         return ("tool", "attempt_completion",
                 json.dumps({"result": "".join(result)}, ensure_ascii=True))
 
+    def _required_parameter_hint(self, name, supplied):
+        """Describe schema-required fields without ever including supplied values."""
+        required = set(self.tool_required.get(name, ()) or ())
+        missing = sorted(required - supplied.keys())
+        if not missing:
+            return None
+        field = missing[0]
+        if (re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', name) and
+                re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', field)):
+            return (f'{name}: missing required parameter {field} '
+                    f'({len(required & supplied.keys())} of {len(required)} '
+                    'required parameters provided)')
+        return None
+
     def _parse_block(self):
         block = self.block
         self.block = ""
+        self.validation_hint = None  # never carry one rejection into the next call
         try:
             d = json.loads(block.strip())
             name = d.get("name")
@@ -1081,6 +1099,10 @@ class ToolCallStreamParser:
                     return self._reject(block, 'invalid-json-arguments')
             if not isinstance(args, dict):
                 return self._reject(block, 'non-object-json-arguments')
+            required = set(self.tool_required.get(name, ()) or ())
+            if not required.issubset(args):
+                self.validation_hint = self._required_parameter_hint(name, args)
+                return self._reject(block, 'missing-json-required-parameter')
             return ("tool", name, json.dumps(args, ensure_ascii=False))
         except Exception:
             completion = self._recover_completion_result(block)
@@ -1117,6 +1139,8 @@ class ToolCallStreamParser:
             key = param.group(1) or param.group(2)
             raw = param.group(3)
             if key not in properties:
+                if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', name):
+                    self.validation_hint = f'{name}: unoffered parameter'
                 return None
             if raw.startswith('\n'):
                 value = raw[1:]
@@ -1131,6 +1155,9 @@ class ToolCallStreamParser:
                 try:
                     parsed = json.loads(value)
                 except (ValueError, TypeError):
+                    if (re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', name) and
+                            re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', key)):
+                        self.validation_hint = f'{name}: parameter {key} must be {kind}'
                     return None
                 expected = {"integer": lambda v: type(v) is int,
                             "number": lambda v: type(v) in (int, float),
@@ -1138,20 +1165,31 @@ class ToolCallStreamParser:
                             "object": lambda v: isinstance(v, dict),
                             "array": lambda v: isinstance(v, list)}
                 if not expected[kind](parsed):
+                    if (re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', name) and
+                            re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', key)):
+                        self.validation_hint = f'{name}: parameter {key} must be {kind}'
                     return None
                 value = parsed
             # Some Zoo contexts cause the model to repeat the same argument
             # once in each parameter spelling. Accept only exact agreement;
             # a conflicting duplicate is ambiguous and must never be run.
             if key in args and args[key] != value:
+                if (re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', name) and
+                        re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,63}', key)):
+                    self.validation_hint = f'{name}: conflicting repeated parameter {key}'
                 return None
             args[key] = value
             pos = param.end()
         # Zoo can append stray closing tags after a complete parameter
         # (e.g. </invoke></parameter>). Accept only those trailing closers;
         # any unexpected text, opening tag, or conflicting value still fails.
-        if (not set(self.tool_required.get(name, ())).issubset(args) or
-                not re.fullmatch(r'\s*(?:</(?:invoke|parameter)>\s*)*', inner[pos:])):
+        # Only offer a concrete hint after the entire envelope and every supplied
+        # field has passed validation. Never include raw argument values or paths.
+        if not re.fullmatch(r'\s*(?:</(?:invoke|parameter)>\s*)*', inner[pos:]):
+            return None
+        missing = set(self.tool_required.get(name, ()) or ()) - args.keys()
+        if missing:
+            self.validation_hint = self._required_parameter_hint(name, args)
             return None
         return ("tool", name, json.dumps(args, ensure_ascii=False))
 
@@ -1639,17 +1677,18 @@ class StrataBackend(pb_grpc.BackendServicer):
                 "Retry with exactly one offered tool using the required " +
                 ("native function/parameter" if dialect == 'native_xml' else "JSON") +
                 " tool_call format. Do not repeat invalid arguments or answer " +
-
-                "with an error message or prose." + IM_END + "\n" +
-                IM_START + "assistant\n"
+                "with an error message or prose."
             )
+            retry_hint = ''
             for attempt in range(retry_count, 3):
                 check_active()
                 published = False
                 try:
                     turn = self._stream(
                         o, streaming=True, retry_count=attempt,
-                        retry_prompt=original if attempt == retry_count else original + reminder,
+                        retry_prompt=(original if attempt == retry_count else
+                                      original + reminder + retry_hint + IM_END + "\n" +
+                                      IM_START + "assistant\n"),
                         _transaction=True, context=context)
                     if progressive:
                         try:
@@ -1665,11 +1704,14 @@ class StrataBackend(pb_grpc.BackendServicer):
                             turn.close()  # cancellation must release the inner generation lock
                         return
                     pending = list(turn)
-                except ToolFormatError:
+                except ToolFormatError as exc:
                     # A visible partial turn cannot be erased or replayed.
                     # Pure tool turns still retry privately as before.
                     if published or attempt == 2:
                         raise
+                    detail = str(exc)
+                    retry_hint = ('\nValidation feedback: ' + detail
+                                  if detail.startswith('Tool call rejected: ') else '')
                     print(f"[strata-backend] regenerating rejected turn ({attempt + 1}/2)",
                           flush=True)
                     continue
@@ -1721,6 +1763,7 @@ class StrataBackend(pb_grpc.BackendServicer):
         tc_index = 0         # tool call index for chat deltas
         rejected_tool = False # current reply must not expose rejected raw markup
         invalid_seen = False
+        validation_hint = None  # safe schema-only explanation for this turn
         # Only the functions actually offered in this request may use the
         # Zoo function/parameter fallback. Their JSON Schemas also preserve
         # numeric/boolean argument types when the model emits plain text.
@@ -1755,7 +1798,7 @@ class StrataBackend(pb_grpc.BackendServicer):
             """Route a decoded chunk through the tool parser + think phases.
 
             Returns (reasoning_delta, content_delta, tool_deltas)."""
-            nonlocal post_think, started_text, tc_index, rejected_tool, invalid_seen, ambiguous_tool_suffix
+            nonlocal post_think, started_text, tc_index, rejected_tool, invalid_seen, ambiguous_tool_suffix, validation_hint
             events = tool_parser.feed(chunk) if chunk else []
             if closing:
                 events += tool_parser.flush()
@@ -1768,6 +1811,8 @@ class StrataBackend(pb_grpc.BackendServicer):
                           flush=True)
                     rejected_tool = True
                     invalid_seen = True
+                    if tool_parser.validation_hint and validation_hint is None:
+                        validation_hint = tool_parser.validation_hint
                     post_think = True
                     started_text = True
                     # Rejected calls are never a normal assistant answer.
@@ -1999,7 +2044,9 @@ class StrataBackend(pb_grpc.BackendServicer):
                     print('[strata-backend] failed tool turn: ambiguous suffix; no calls published', flush=True)
                     raise ToolFormatError('Ambiguous tool turn; no calls published')
                 if progressive and invalid_seen:
-                    raise ToolFormatError('Invalid tool neighbor; no calls published')
+                    detail = (f'Tool call rejected: {validation_hint}; no calls published'
+                              if validation_hint else 'Invalid tool neighbor; no calls published')
+                    raise ToolFormatError(detail)
                 rejection_echo = cd_content.strip() == (
                     "Tool call rejected: invalid format. Retry with an offered tool.")
                 if streaming and tc_index == 0 and tool_specs and (
@@ -2010,7 +2057,10 @@ class StrataBackend(pb_grpc.BackendServicer):
                           f'generated_tokens={tok_idx} inside_think={inside_think} '
                           f'post_think={post_think} '
                           f'tool_marker_in_reason={"<tool_call>" in cd_reason}', flush=True)
-                    raise ToolFormatError("Invalid, empty or incomplete tool turn; no calls published")
+                    detail = (f'Tool call rejected: {validation_hint}; no calls published'
+                              if validation_hint and invalid_seen else
+                              'Invalid, empty or incomplete tool turn; no calls published')
+                    raise ToolFormatError(detail)
                 if deferred_tools:
                     # The whole turn has passed suffix/rejection validation.
                     # No executable call was published while it could change.
