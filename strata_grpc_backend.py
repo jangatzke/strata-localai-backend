@@ -59,6 +59,51 @@ class ToolFormatError(RuntimeError):
     """A tool-enabled turn failed closed before any calls were published."""
 
 
+def _capture_rejected_tool(cfg, block, reason, tool_specs, tool_required):
+    """Opt-in, expiring raw evidence in a private file, never in journald.
+
+    The operator provisions the directory as the bridge service user, mode 0700.
+    Values may contain credentials or entire file contents.
+    """
+    settings = cfg.get('rejected_tool_capture')
+    if not isinstance(settings, dict):
+        return
+    deadline = settings.get('until_epoch')
+    directory = settings.get('directory')
+    if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+        return
+    deadline = float(deadline)
+    if (time.time() >= deadline or not isinstance(directory, str) or
+            not os.path.isabs(directory)):
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if info.st_uid != os.geteuid() or (info.st_mode & 0o077):
+                return
+            payload = json.dumps({
+                'captured_at_epoch': time.time(), 'reason': reason,
+                'block': block, 'tool_specs': tool_specs,
+                'tool_required': {name: sorted(names) for name, names in tool_required.items()},
+            }, ensure_ascii=False).encode('utf-8')
+            # Fail without a partial capture rather than fill the service disk.
+            if len(payload) > 2 * 1024 * 1024:
+                return
+            name = uuid.uuid4().hex + '.json'
+            out_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=fd)
+            with os.fdopen(out_fd, 'wb') as out:
+                out.write(payload)
+                out.flush()
+                os.fsync(out.fileno())
+        finally:
+            os.close(fd)
+    except (OSError, TypeError, ValueError):
+        # Never log a payload, path, or exception containing sensitive values.
+        print('[strata-backend] rejected-tool capture unavailable', flush=True)
+
+
 class EngineLogFollower:
     """Tails the engine's log file and mirrors interesting lines to stdout.
 
@@ -770,9 +815,10 @@ class ToolCallStreamParser:
     """
 
     def __init__(self, tool_specs=None, tool_required=None, tool_dialect='json',
-                 strict_markup=False):
+                 strict_markup=False, reject_capture=None):
         self.tool_dialect = tool_dialect
         self.strict_markup = strict_markup
+        self.reject_capture = reject_capture
         self.any_xml_call = False
         self.mode = "text"
         self.buf = ""
@@ -878,7 +924,7 @@ class ToolCallStreamParser:
                         if orphan:
                             out.append(("text", self.buf[:orphan]))
                         self.buf = self.buf[orphan + len(self.t_close):]
-                        out.append(self._reject('', 'orphan-tool-delimiter'))
+                        out.append(self._reject(self.t_close, 'orphan-tool-delimiter'))
                         continue
                 if idx >= 0:
                     if idx:
@@ -972,6 +1018,12 @@ class ToolCallStreamParser:
         self.last_rejection = (f"reason={reason} dialect={dialect} tool={offered} "
                                f"parameter_count={params} chars={len(block)} "
                                f"function_closed={'</function>' in block}{json_shape}")
+        if self.reject_capture is not None:
+            try:
+                self.reject_capture(block, reason, self.tool_specs, self.tool_required)
+            except Exception:
+                # Capturing diagnostics must never change tool validation or leak values.
+                print('[strata-backend] rejected-tool capture unavailable', flush=True)
         return ("invalid_tool",)
 
     def _recover_completion_result(self, block):
@@ -1111,7 +1163,7 @@ class ToolCallStreamParser:
         elif self.buf:
             if (self.strict_markup and
                     (self.t_open.startswith(self.buf) or self.t_close.startswith(self.buf))):
-                out.append(self._reject('', 'incomplete-tool-delimiter'))
+                out.append(self._reject(self.buf, 'incomplete-tool-delimiter'))
             else:
                 out.append(("text", self.buf))
         self.buf = ""
@@ -1686,8 +1738,13 @@ class StrataBackend(pb_grpc.BackendServicer):
         except (ValueError, TypeError, AttributeError):
             pass
         progressive = streaming and _transaction and bool(getattr(self, 'cfg', {}).get('stream_tool_text', False))
-        tool_parser = ToolCallStreamParser(tool_specs, tool_required, dialect,
-                                           strict_markup=progressive)
+        reject_capture = None
+        if getattr(self, 'cfg', {}).get('rejected_tool_capture'):
+            reject_capture = (lambda block, reason, specs, required:
+                              _capture_rejected_tool(self.cfg, block, reason, specs, required))
+        tool_parser = ToolCallStreamParser(
+            tool_specs, tool_required, dialect, strict_markup=progressive,
+            reject_capture=reject_capture)
         deferred_tools = []
         finished = {"tokens": 0, "elapsed": 0.0}
         tok_idx = 0

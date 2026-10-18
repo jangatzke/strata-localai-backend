@@ -86,7 +86,7 @@ Generate the protobuf stubs and install requirements first. Run CPU regressions 
 ```bash
 ./venv/bin/python -m unittest -q \
   test_parser test_recovery test_batch test_vision test_lifecycle \
-  test_serial_ownership test_adaptive
+  test_serial_ownership test_adaptive test_rejected_capture
 ./venv/bin/python test_recovery_grpc.py
 ./venv/bin/python -m py_compile strata_grpc_backend.py
 ```
@@ -119,6 +119,19 @@ Service status: `systemctl status strata-localai-backend`. Logs: `journalctl -u 
 - JSON envelope scanning is string/escape-aware. Closing markers inside a valid JSON string remain argument data across arbitrary stream boundaries. Native raw strings are inherently ambiguous for some literal delimiter sequences; do not claim arbitrary payloads are always representable. Native string values are not XML-unescaped or silently repaired; template formatting newlines and the legacy fallback have separate conventions.
 - Explicit thinking phases bypass the tool parser. Recognized thinking control tokens are not appended to structured reasoning. Each new byte block enters the incremental UTF-8 decoder once, and the decoder is finalized with empty input.
 - Non-streaming `Predict` aggregates the same safe path and retains structured chat deltas rather than asking LocalAI to reparse rejected/raw tool text. Diagnostics report lengths and fixed parser-state/shape metadata, not prompt excerpts or argument values.
+
+### Temporary capture of rejected tool calls
+
+For a short troubleshooting window only, add the following optional object to the **bridge** JSON (use a future UTC Unix timestamp for `until_epoch`):
+
+```json
+"rejected_tool_capture": {
+  "directory": "/var/lib/stratal/rejected-tool-capture",
+  "until_epoch": 1792350000
+}
+```
+
+Create the directory in advance, owned by the bridge service user with mode `0700`. The capture silently expires when the timestamp passes; remove the setting and delete the files when diagnosis is complete. The Python bridge process must restart to load new code, while later JSON changes are read on the next engine spawn. Each rejected parser block is stored verbatim with its reason, offered tool properties and required keys in a unique mode-`0600` JSON file. The fixed tool-envelope delimiters are not included in `block`; incomplete blocks retain whatever bytes were available, and orphan delimiters are captured. Files are limited to 2 MiB per rejection; oversized blocks are **not** partially logged. The regular journal remains structural-only. **These private files can contain credentials, file contents or user data**: never copy them to tickets, stdout, shared logs, or backups without an explicit handling policy. Only enable capture for an authorized test window.
 
 ## Cleanup, cancellation and shutdown
 
