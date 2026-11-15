@@ -767,8 +767,7 @@ def _native_tool_history(prompt, dialect='native_xml'):
     opening, closing = '<bridge_tool_history>', '</bridge_tool_history>'
     decoder = json.JSONDecoder()
 
-    def frame(match):
-        text = match.group(1)
+    def frame(text):
         out, pos = [], 0
         while True:
             start = text.find(opening, pos)
@@ -802,8 +801,42 @@ def _native_tool_history(prompt, dialect='native_xml'):
             pos = end + len(closing)
         return IM_START + 'assistant\n' + ''.join(out) + IM_END
 
-    return re.sub(re.escape(IM_START) + r'assistant\n(.*?)' + re.escape(IM_END),
-                  frame, prompt, flags=re.DOTALL)
+    # A frame terminator written *inside* a marked JSON string is data, not
+    # the end of the assistant message. Locate frame boundaries only after
+    # skipping whole marked values (user/tool frames are copied unchanged).
+    header = IM_START + 'assistant\n'
+    output, pos = [], 0
+    while True:
+        start = prompt.find(header, pos)
+        if start < 0:
+            output.append(prompt[pos:])
+            break
+        output.append(prompt[pos:start])
+        body_start = start + len(header)
+        cursor = body_start
+        while True:
+            end = prompt.find(IM_END, cursor)
+            marked = prompt.find(opening, cursor)
+            if end < 0:
+                output.append(prompt[start:])  # unfinished generation header
+                return ''.join(output)
+            if marked < 0 or marked >= end:
+                output.append(frame(prompt[body_start:end]))
+                pos = end + len(IM_END)
+                break
+            index = marked + len(opening)
+            while index < len(prompt) and prompt[index].isspace():
+                index += 1
+            try:
+                _, after = decoder.raw_decode(prompt, index)
+                while after < len(prompt) and prompt[after].isspace():
+                    after += 1
+                if not prompt.startswith(closing, after):
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise ToolFormatError('Invalid marked tool history') from None
+            cursor = after + len(closing)
+    return ''.join(output)
 
 
 class ToolCallStreamParser:
@@ -1711,6 +1744,10 @@ class StrataBackend(pb_grpc.BackendServicer):
                     if published or attempt == 2:
                         raise
                     detail = str(exc)
+                    # The history belongs to the input, not a generated reply;
+                    # sampling the same invalid input cannot repair it.
+                    if detail == 'Invalid marked tool history':
+                        raise
                     retry_hint = ('\nValidation feedback: ' + detail
                                   if detail.startswith('Tool call rejected: ') else '')
                     print(f"[strata-backend] regenerating rejected turn ({attempt + 1}/2)",

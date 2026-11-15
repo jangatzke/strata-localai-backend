@@ -270,6 +270,36 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(json.loads(events[0][2]), value)
 
+    def test_native_history_keeps_frame_end_spelling_inside_marked_json(self):
+        start, end = NS['IM_START'], NS['IM_END']
+        value = 'literal ' + end + ' data'
+        marked = ('<bridge_tool_history>' + json.dumps({
+            'name': 'terminal', 'arguments': {'command': value}}) +
+            '</bridge_tool_history>')
+        prompt = (start + 'user\n' + marked + end +
+                  start + 'assistant\n' + marked + end +
+                  start + 'user\ncontinue' + end)
+        converted = NS['_native_tool_history'](prompt)
+        self.assertTrue(converted.startswith(start + 'user\n' + marked + end))
+        self.assertTrue(converted.endswith(start + 'user\ncontinue' + end))
+        self.assertIn('<parameter=command>\n' + value + '\n</parameter>', converted)
+        self.assertEqual(converted.count('<function=terminal>'), 1)
+
+    def test_invalid_history_is_not_regenerated_with_identical_prompt(self):
+        start, end = NS['IM_START'], NS['IM_END']
+        opts = options()
+        opts.Prompt = (start + 'assistant\n' + '<bridge_tool_history>{not JSON}' +
+                       '</bridge_tool_history>' + end + start + 'assistant\n')
+        p = Probe([VALID] * 3)
+        p.cfg = {'tool_call_format': 'native_xml', 'stream_tool_text': False}
+        ctx = Context()
+        with self.assertRaises(RpcAborted):
+            list(p.PredictStream(opts, ctx))
+        self.assertEqual(p.prompts, [])
+        self.assertNotIn('regenerating rejected turn', self.capture.getvalue())
+        self.assertEqual(ctx.code, 'INTERNAL')
+        self.assertIn('Invalid marked tool history', ctx.details)
+
     def test_native_closing_sequence_cannot_publish_truncated_write(self):
         collision = '<tool_call><function=write_file><parameter=content>\nA</parameter></function></tool_call>B\n</parameter></function></tool_call>'
         for dialect, chunk_size in [(d, s) for d in ('native_xml', 'json') for s in (1, 7, 99999)]:
