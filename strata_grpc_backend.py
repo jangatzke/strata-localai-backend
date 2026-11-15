@@ -722,7 +722,8 @@ def _tool_system_block(tools_json: str, dialect='json') -> str:
     if dialect == 'native_xml':
         return ('# Tools\n\nYou have access to the following functions:\n\n<tools>\n' +
                 '\n'.join(specs) + '\n</tools>\n\n'
-                'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
+                'If you choose to call a function, use ONLY the exact format below, '
+                'with NO suffix. Alternative invocation syntax is not executable.\n\n'
                 '<tool_call>\n<function=example_function_name>\n'
                 '<parameter=example_parameter_1>\nvalue_1\n</parameter>\n'
                 '<parameter=example_parameter_2>\nThis is the value for the second parameter\n'
@@ -2049,16 +2050,28 @@ class StrataBackend(pb_grpc.BackendServicer):
                     raise ToolFormatError(detail)
                 rejection_echo = cd_content.strip() == (
                     "Tool call rejected: invalid format. Retry with an offered tool.")
+                # In the native dialect an alternate XML invocation is only
+                # text, not a parsed tool call. Never publish it as if an
+                # action had been performed; privately regenerate instead.
+                literal_call = (dialect == 'native_xml' and tc_index == 0 and
+                                bool(re.match(
+                                    r'\s*<(?:invoke\s+name=["\'][A-Za-z_][\w.-]*["\']|'
+                                    r'function=[A-Za-z_][\w.-]*)>', cd_content)))
                 if streaming and tc_index == 0 and tool_specs and (
-                        invalid_seen or rejection_echo or not cd_content.strip()):
+                        invalid_seen or rejection_echo or literal_call or
+                        not cd_content.strip()):
                     print('[strata-backend] failed tool turn: '
                           f'invalid={invalid_seen} echo={rejection_echo} '
+                          f'literal_invocation={literal_call} '
                           f'reason_chars={len(cd_reason)} content_chars={len(cd_content)} '
                           f'generated_tokens={tok_idx} inside_think={inside_think} '
                           f'post_think={post_think} '
                           f'tool_marker_in_reason={"<tool_call>" in cd_reason}', flush=True)
                     detail = (f'Tool call rejected: {validation_hint}; no calls published'
                               if validation_hint and invalid_seen else
+                              'Tool call rejected: alternate invocation syntax; use only the '
+                              'specified tool_call function/parameter format; no calls published'
+                              if literal_call else
                               'Invalid, empty or incomplete tool turn; no calls published')
                     raise ToolFormatError(detail)
                 if deferred_tools:

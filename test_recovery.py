@@ -203,6 +203,28 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn('1 of 2 required parameters provided', p.prompts[1])
         self.assertNotIn('PRIVATE-PATH', p.prompts[1])
 
+    def test_literal_invoke_markup_is_not_published_as_a_tool_call(self):
+        # A native-looking call in content is neither executable nor a final answer.
+        fake = '<invoke name="functions.terminal"><parameter name="command">PRIVATE-CMD</parameter></invoke>'
+        p = Probe([fake, VALID], size=7)
+        p.cfg = {'tool_call_format': 'native_xml', 'stream_tool_text': False}
+        calls, content = flatten(list(p.PredictStream(options(), Context())))
+        self.assertEqual(len(p.prompts), 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(content, '')
+        self.assertNotIn('PRIVATE-CMD', ''.join(p.prompts))
+        self.assertNotIn('PRIVATE-CMD', self.capture.getvalue())
+
+    def test_literal_invoke_exhaustion_is_an_error_not_a_fake_action(self):
+        fake = '<invoke name="functions.terminal"><parameter name="command">PRIVATE-CMD</parameter></invoke>'
+        p = Probe([fake] * 3)
+        p.cfg = {'tool_call_format': 'native_xml', 'stream_tool_text': False}
+        ctx = Context()
+        with self.assertRaises(RpcAborted):
+            list(p.PredictStream(options(), ctx))
+        self.assertEqual(ctx.code, 'INTERNAL')
+        self.assertNotIn('PRIVATE-CMD', ctx.details)
+
     def test_echo_after_invalid_attempt_is_not_a_successful_final_answer(self):
         p = Probe([INVALID, ERROR, VALID])
         calls, text = flatten(list(p.PredictStream(options(), Context())))
