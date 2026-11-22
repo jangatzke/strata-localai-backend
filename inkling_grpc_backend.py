@@ -2265,18 +2265,34 @@ class InklingBackend(StrataBackend):
             elif self.image_pad in ids:
                 raise ValueError('image placeholder requires image payload')
             tools = {}
+            declared = []
             if o.Tools:
-                declared = json.loads(o.Tools)
-                if not isinstance(declared, list):
+                parsed_tools = json.loads(o.Tools)
+                if not isinstance(parsed_tools, list):
                     raise ValueError('Tools must be an array')
+                declared = parsed_tools
                 for item in declared:
                     fn = item.get('function', item)
                     name = fn['name']
                     if not isinstance(name, str) or name in tools:
                         raise ValueError('invalid or duplicate offered tool')
                     tools[name] = set((fn.get('parameters') or {}).get('required', []))
+            if tools:
                 if not prompt.startswith('<|message_system|>tool_declare<|content_xml|>'):
-                    raise ValueError('tools require Inkling tool_declare in the rendered prompt')
+                    # LocalAI's chat template does not render OpenAI tools; add the
+                    # Inkling tool_declare system message the HF chat_template.jinja
+                    # would have emitted ahead of the messages.
+                    specs = []
+                    for item in declared:
+                        fn = item.get('function', item)
+                        specs.append({'description': str(fn.get('description') or ''),
+                                      'name': fn['name'],
+                                      'parameters': fn.get('parameters') or {},
+                                      'type': str(item.get('type') or 'function')})
+                    declaration = ('<|message_system|>tool_declare<|content_xml|>'
+                                   + json.dumps(specs, sort_keys=True, separators=(',', ':'))
+                                   + '<|end_message|>')
+                    ids = self.tok.encode(declaration, parse_special=True) + ids
             if o.Tokens <= 0:
                 self._ensure_loaded()
             limit = _generation_limit(o.Tokens, len(ids), self.engine.max_context if o.Tokens <= 0 else 0)

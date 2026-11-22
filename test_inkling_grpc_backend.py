@@ -85,6 +85,43 @@ class InklingBridgeTests(unittest.TestCase):
         self.assertRegex(captured.getvalue(),
                          r'\[strata-test\] stop_ids hit at token 2: tid=200006')
 
+    def test_openai_tools_without_rendered_declaration_are_synthesized(self):
+        tok = self.m.build_tokenizer(TOKENIZER_CONFIG)
+        b = self.m.InklingBackend({'model_name': 'inkling', 'parallel': 1}, tok)
+        seen = {}
+        def fake_generate(ids, *args, **kwargs):
+            seen['ids'] = list(ids)
+            return iter([200001, *tok.encode('lookup'), 200049,
+                         *tok.encode('{"name":"lookup","args":{"q":"a"}}'), 200010, 200006])
+        b._ensure_loaded = lambda: None
+        b._generate = fake_generate
+        o = self._request('<|message_user|><|content_text|>go<|end_message|><|message_model|>',
+                          tools=json.dumps([{'type': 'function', 'function': {
+                              'name': 'lookup', 'description': 'Find things',
+                              'parameters': {'type': 'object', 'properties': {'q': {'type': 'string'}},
+                                             'required': ['q']}}}]))
+        replies = list(b._stream(o))
+        calls = [tc for r in replies for d in r.chat_deltas for tc in d.tool_calls]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, 'lookup')
+        self.assertEqual(json.loads(calls[0].arguments), {'q': 'a'})
+        prefix = tok.encode('<|message_system|>tool_declare<|content_xml|>'
+                            '[{"description":"Find things","name":"lookup",'
+                            '"parameters":{"properties":{"q":{"type":"string"}},'
+                            '"required":["q"],"type":"object"},"type":"function"}]<|end_message|>',
+                            parse_special=True)
+        self.assertEqual(seen['ids'][:len(prefix)], prefix)
+
+    def test_empty_tools_array_is_treated_as_no_tools(self):
+        tok = self.m.build_tokenizer(TOKENIZER_CONFIG)
+        b = self.m.InklingBackend({'model_name': 'inkling', 'parallel': 1}, tok)
+        b._ensure_loaded = lambda: None
+        b._generate = lambda *args, **kwargs: iter([200001, 200004, *tok.encode('OK'), 200006])
+        b.engine.drain = lambda: None
+        o = self._request('<|message_user|><|content_text|>hi<|end_message|><|message_model|>',
+                          tools='[]')
+        self.assertEqual(''.join(r.message.decode() for r in b._stream(o)), 'OK')
+
     def test_invalid_tool_call_does_not_emit_success_marker(self):
         from contextlib import redirect_stdout
         from io import StringIO
