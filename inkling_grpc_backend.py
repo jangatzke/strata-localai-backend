@@ -2151,12 +2151,16 @@ class StrataBackend(pb_grpc.BackendServicer):
             return pb.Reply(message=text.encode("utf-8"), tokens=tokens,
                             prompt_tokens=prompt_tokens, chat_deltas=chat_deltas)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     def PredictStream(self, request, context):
         try:
             yield from self._stream(request, context=context)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     def TokenizeString(self, request, context):
