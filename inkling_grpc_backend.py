@@ -1654,6 +1654,10 @@ class StrataBackend(pb_grpc.BackendServicer):
                 if n > 0 and elapsed > 0:
                     print(f"[strata-backend] GEN done: {n} tokens in {elapsed:.1f}s "
                           f"({n / elapsed:.1f} tok/s)", flush=True)
+                if n == 0:
+                    # A zero-token DONE hides the engine's finish reason
+                    # (e.g. nonfinite logits); surface it for diagnostics.
+                    print(f"[strata-backend] GEN done with 0 tokens: {line.strip()}", flush=True)
                 return {"tokens": n, "elapsed": elapsed}
 
     def _stream(self, o, streaming=True, retry_count=0, retry_prompt=None,
