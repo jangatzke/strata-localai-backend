@@ -462,6 +462,10 @@ class Engine:
                             parts = line.split()
                             finish = parts[5] if len(parts) > 5 else None
                             completed = True
+                            if not out or (finish and finish not in ("stop", "length")):
+                                # A zero-token DONE hides the engine's finish
+                                # reason (e.g. nonfinite logits); surface it.
+                                print(f"[strata-backend] engine DONE with 0 tokens: {line.strip()}", flush=True)
                             break
             finally:
                 try:
