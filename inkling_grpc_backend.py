@@ -2266,6 +2266,7 @@ class InklingBackend(StrataBackend):
                 raise ValueError('image placeholder requires image payload')
             tools = {}
             declared = []
+            synthesized = False
             if o.Tools:
                 parsed_tools = json.loads(o.Tools)
                 if not isinstance(parsed_tools, list):
@@ -2281,13 +2282,17 @@ class InklingBackend(StrataBackend):
                 if not prompt.startswith('<|message_system|>tool_declare<|content_xml|>'):
                     # LocalAI's chat template does not render OpenAI tools; add the
                     # Inkling tool_declare system message the HF chat_template.jinja
-                    # would have emitted ahead of the messages.
+                    # would have emitted ahead of the messages. The model was
+                    # trained on bare {"type":"object"} parameter specs: a full
+                    # JSON schema (properties/required) makes it end the turn
+                    # with no content, so the schema is stripped here.
+                    synthesized = True
                     specs = []
                     for item in declared:
                         fn = item.get('function', item)
                         specs.append({'description': str(fn.get('description') or ''),
                                       'name': fn['name'],
-                                      'parameters': fn.get('parameters') or {},
+                                      'parameters': {'type': 'object'},
                                       'type': str(item.get('type') or 'function')})
                     declaration = ('<|message_system|>tool_declare<|content_xml|>'
                                    + json.dumps(specs, sort_keys=True, separators=(',', ':'))
@@ -2351,7 +2356,8 @@ class InklingBackend(StrataBackend):
                     if not isinstance(obj, dict) or not isinstance(obj.get('args'), dict):
                         raise ToolFormatError('Inkling tool args must be a JSON object')
                     name = obj.get('name')
-                    if name not in tools or name != header or not tools[name].issubset(obj['args']):
+                    if name not in tools or name != header or (
+                            not synthesized and not tools[name].issubset(obj['args'])):
                         raise ToolFormatError('unoffered or incomplete Inkling tool call')
                     call = pb.ToolCallDelta(index=index, id=str(uuid.uuid4()), name=name,
                                             arguments=json.dumps(obj['args'], ensure_ascii=False))

@@ -105,12 +105,31 @@ class InklingBridgeTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, 'lookup')
         self.assertEqual(json.loads(calls[0].arguments), {'q': 'a'})
+        # The model was trained with bare {"type":"object"} parameter specs; full
+        # JSON schemas (properties/required) make it end the turn immediately.
         prefix = tok.encode('<|message_system|>tool_declare<|content_xml|>'
                             '[{"description":"Find things","name":"lookup",'
-                            '"parameters":{"properties":{"q":{"type":"string"}},'
-                            '"required":["q"],"type":"object"},"type":"function"}]<|end_message|>',
+                            '"parameters":{"type":"object"},"type":"function"}]<|end_message|>',
                             parse_special=True)
         self.assertEqual(seen['ids'][:len(prefix)], prefix)
+
+    def test_synthesized_declaration_accepts_calls_without_schema_args(self):
+        tok = self.m.build_tokenizer(TOKENIZER_CONFIG)
+        b = self.m.InklingBackend({'model_name': 'inkling', 'parallel': 1}, tok)
+        b._ensure_loaded = lambda: None
+        b._generate = lambda *args, **kwargs: iter([200001, *tok.encode('lookup'), 200049,
+                                                    *tok.encode('{"name":"lookup","args":{}}'),
+                                                    200010, 200006])
+        b.engine.drain = lambda: None
+        o = self._request('<|message_user|><|content_text|>go<|end_message|><|message_model|>',
+                          tools=json.dumps([{'type': 'function', 'function': {
+                              'name': 'lookup', 'description': 'Find things',
+                              'parameters': {'type': 'object', 'properties': {'q': {'type': 'string'}},
+                                             'required': ['q']}}}]))
+        calls = [tc for r in b._stream(o) for d in r.chat_deltas for tc in d.tool_calls]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, 'lookup')
+        self.assertEqual(json.loads(calls[0].arguments), {})
 
     def test_empty_tools_array_is_treated_as_no_tools(self):
         tok = self.m.build_tokenizer(TOKENIZER_CONFIG)
