@@ -2290,18 +2290,20 @@ class InklingBackend(StrataBackend):
                 if not prompt.startswith('<|message_system|>tool_declare<|content_xml|>'):
                     # LocalAI's chat template does not render OpenAI tools; add the
                     # Inkling tool_declare system message the HF chat_template.jinja
-                    # would have emitted ahead of the messages. The model was
-                    # trained on bare {"type":"object"} parameter specs: a full
-                    # JSON schema (properties/required) makes it end the turn
-                    # with no content, so the schema is stripped here.
+                    # would have emitted ahead of the messages. The full parameter
+                    # schema is kept so the model can fill required arguments;
+                    # the 64-token prefill NaN is handled by --chunk 48 upstream.
                     synthesized = True
                     specs = []
                     for item in declared:
                         fn = item.get('function', item)
-                        specs.append({'description': str(fn.get('description') or ''),
-                                      'name': fn['name'],
-                                      'parameters': {'type': 'object'},
-                                      'type': str(item.get('type') or 'function')})
+                        spec = {'description': str(fn.get('description') or ''),
+                                'name': fn['name'],
+                                'parameters': fn.get('parameters') or {'type': 'object'},
+                                'type': str(item.get('type') or 'function')}
+                        if not spec['description']:
+                            spec.pop('description')
+                        specs.append(spec)
                     declaration = ('<|message_system|>tool_declare<|content_xml|>'
                                    + json.dumps(specs, sort_keys=True, separators=(',', ':'))
                                    + '<|end_message|>')

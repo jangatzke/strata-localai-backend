@@ -105,11 +105,13 @@ class InklingBridgeTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, 'lookup')
         self.assertEqual(json.loads(calls[0].arguments), {'q': 'a'})
-        # The model was trained with bare {"type":"object"} parameter specs; full
-        # JSON schemas (properties/required) make it end the turn immediately.
+        # The full parameter schema is kept in the synthesized declaration so the
+        # model can fill required arguments (the 64-token prefill NaN is handled
+        # by --chunk 48 in the engine args, not by stripping the schema).
         prefix = tok.encode('<|message_system|>tool_declare<|content_xml|>'
                             '[{"description":"Find things","name":"lookup",'
-                            '"parameters":{"type":"object"},"type":"function"}]<|end_message|>',
+                            '"parameters":{"properties":{"q":{"type":"string"}},'
+                            '"required":["q"],"type":"object"},"type":"function"}]<|end_message|>',
                             parse_special=True)
         self.assertEqual(seen['ids'][:len(prefix)], prefix)
 
